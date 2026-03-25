@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  # 조장님의 메인 서버
+  api-gateway:
+    build: ./api_gateway
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - redis
+
+  # 팀원들의 서버 (예시: 검색 엔진)
+  search-engine:
+    build: ./search_engine
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./data:/app/data
+
+  # 공용 저장소
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
