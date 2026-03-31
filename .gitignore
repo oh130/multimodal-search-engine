@@ -205,4 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ========================
+# Data (large / local only)
+# ========================
+data/raw/
+data/processed/
+
+# ========================
+# Local config
+# ========================
+AGENTS.md
 /.claude
