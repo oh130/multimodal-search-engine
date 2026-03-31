@@ -1,17 +1,15 @@
 version: '3.8'
 
 services:
-  # 조장님의 메인 서버
+  # 조장님 파트 (Gateway)
   api-gateway:
     build: ./api_gateway
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
-    depends_on:
-      - redis
+      - ./data:/app/data  # 공용 데이터 폴더 공유
 
-  # 팀원들의 서버 (예시: 검색 엔진)
+  # B 파트 (검색)
   search-engine:
     build: ./search_engine
     ports:
@@ -19,7 +17,15 @@ services:
     volumes:
       - ./data:/app/data
 
-  # 공용 저장소
+  # C 파트 (모델)
+  rec-models:
+    build: ./rec_models
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./data:/app/data
+
+  # 공용 DB
   redis:
     image: redis:latest
     ports:

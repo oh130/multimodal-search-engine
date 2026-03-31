@@ -216,3 +216,4 @@ data/processed/
 # Local config
 # ========================
 AGENTS.md
+/.claude
