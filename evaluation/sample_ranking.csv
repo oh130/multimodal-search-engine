@@ -1,0 +1,6 @@
+query_id,ranked_items,relevant_items
+q1,"item_7|item_3|item_9|item_1","item_3"
+q2,"item_2|item_6|item_8|item_4","item_4|item_8"
+q3,"item_5|item_1|item_2|item_3","item_10"
+q4,"item_4|item_2|item_6|item_7","item_4"
+q5,"item_9|item_8|item_1|item_5","item_8|item_1"
