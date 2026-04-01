@@ -1,0 +1,151 @@
+"""
+API Gateway — port 8000
+
+엔드포인트:
+  POST /api/search            search-engine 프록시
+  GET  /api/recommend         Redis 세션 붙여서 rec-models 프록시
+  POST /api/events            Redis에 클릭/구매 이벤트 저장
+  GET  /api/features/{user_id} Redis 유저 피처 조회
+  GET  /health
+"""
+
+import os
+import httpx
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+from feature_store import RedisFeatureStore
+
+# ── 서비스 URL (docker-compose 서비스명 또는 환경변수로 오버라이드) ──
+SEARCH_URL = os.getenv("SEARCH_ENGINE_URL", "http://search-engine:8002")
+REC_URL = os.getenv("REC_MODELS_URL", "http://rec-models:8003")
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+
+feature_store: RedisFeatureStore
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global feature_store
+    feature_store = RedisFeatureStore(host=REDIS_HOST, port=REDIS_PORT)
+    yield
+
+
+app = FastAPI(title="API Gateway", lifespan=lifespan)
+
+
+# ── 요청/응답 스키마 ──────────────────────────────────────────
+
+class SearchRequest(BaseModel):
+    query: str = ""
+    image_base64: str | None = None
+    top_k: int = 20
+
+
+class EventRequest(BaseModel):
+    user_id: str
+    item_id: str
+    event_type: str  # "click" | "purchase"
+    category: str | None = None
+
+
+# ── 엔드포인트 ────────────────────────────────────────────────
+
+@app.post("/api/search")
+async def search(req: SearchRequest):
+    """search-engine으로 검색 요청을 프록시한다."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(
+                f"{SEARCH_URL}/search",
+                json=req.model_dump(),
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=503, detail=f"search-engine 연결 실패: {e}")
+    return resp.json()
+
+
+@app.get("/api/recommend")
+async def recommend(
+    user_id: str = Query(...),
+    top_k: int = Query(20),
+):
+    """Redis 세션 데이터를 붙여 rec-models로 추천 요청을 프록시한다."""
+    features = feature_store.get_user_features(user_id)
+
+    params = {
+        "user_id": user_id,
+        "top_k": top_k,
+        "recent_clicks": ",".join(features["recent_clicks"]),
+        "click_count": features["click_count"],
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{REC_URL}/recommend", params=params)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=503, detail=f"rec-models 연결 실패: {e}")
+
+    return resp.json()
+
+
+@app.post("/api/events")
+async def events(req: EventRequest):
+    """클릭/구매 이벤트를 Redis에 저장하고 rec-models 세션도 업데이트한다."""
+    # Redis 업데이트
+    if req.event_type in ("click", "purchase"):
+        feature_store.push_click(req.user_id, req.item_id)
+
+    if req.category:
+        interest = feature_store.get_session_interest(req.user_id)
+        interest[req.category] = interest.get(req.category, 0) + 1
+        feature_store.set_session_interest(req.user_id, interest)
+
+    # rec-models 세션 업데이트 (실패해도 이벤트 저장은 성공으로 처리)
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            await client.post(
+                f"{REC_URL}/session/update",
+                json={
+                    "user_id": req.user_id,
+                    "item_id": req.item_id,
+                    "event": req.event_type,
+                },
+            )
+        except httpx.RequestError:
+            pass  # rec-models가 아직 없어도 게이트웨이는 정상 응답
+
+    return {"status": "ok"}
+
+
+@app.get("/api/features/{user_id}")
+async def get_features(user_id: str):
+    """Redis에 저장된 유저 피처를 반환한다."""
+    return feature_store.get_user_features(user_id)
+
+
+@app.get("/health")
+async def health():
+    try:
+        feature_store.r.ping()
+        redis_ok = True
+    except Exception:
+        redis_ok = False
+
+    return {
+        "status": "ok" if redis_ok else "degraded",
+        "redis": redis_ok,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
