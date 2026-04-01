@@ -6,6 +6,7 @@
 
 - `metrics.py`: `HitRate@K`, `MRR`, `nDCG@K` 계산
 - `ab_test.py`: A/B 테스트용 `p-value`, 신뢰구간 계산
+- `baseline_a.py`: metadata + popularity 기반 baseline A 생성 및 오프라인 평가
 - `streamlit_app.py`: 랭킹/A-B 평가 결과 시각화 대시보드
 - `sample_ranking.csv`: 랭킹 평가용 예시 입력 파일
 - `sample_ab.csv`: A/B 테스트용 예시 입력 파일
@@ -15,6 +16,12 @@
 ```powershell
 python -m pip install streamlit pandas altair
 python -m streamlit run .\evaluation\streamlit_app.py
+```
+
+Baseline A 실행:
+
+```powershell
+python .\evaluation\baseline_a.py --top-k 10
 ```
 
 ## CSV 형식
