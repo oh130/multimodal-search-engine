@@ -209,8 +209,8 @@ __marimo__/
 # ========================
 # Data (large / local only)
 # ========================
-data/raw/
-data/processed/
+data/raw_data/
+#data/processed/#
 
 # ========================
 # Local config
