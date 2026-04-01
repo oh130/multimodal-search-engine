@@ -1,7 +1,7 @@
 import csv
 
 input_file = "customers.csv"
-output_file = "customer_features.csv"
+output_file = "customer_extract_features.csv"
 
 with open(input_file, newline="", encoding="utf-8") as infile, \
      open(output_file, "w", newline="", encoding="utf-8") as outfile:
