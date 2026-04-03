@@ -1,40 +1,454 @@
-# multimodal-search-engine
-2026-1. Capstone Design I
+# 추천 서비스 (`rec_models`)
 
-# Recommendation Models
+`rec_models`는 본 프로젝트의 추천 시스템 서비스 모듈입니다. FastAPI 기반 추천 서버를 통해 상품 추천 결과를 제공하며, 후보 생성부터 랭킹, 리랭킹, 오프라인 평가, Docker 단독 실행까지 포함합니다.
 
-이 디렉토리는 추천 시스템의 핵심 모델 파트를 담당한다.
+현재 기준으로 구현이 완료된 범위는 다음과 같습니다.
 
-## 역할
-- Candidate Generation 모델(Two-Tower) 구현
-- Ranking 모델(DeepFM 또는 Wide&Deep) 구현
-- 세션 기반 추천 로직 지원
-- 서비스 추론용 추천 파이프라인 제공
+- candidate generation
+- ranking inference
+- reranking
+- offline evaluation
+- API serving
+- Docker standalone execution
 
-## 디렉토리 구조
+## 1. 프로젝트 개요
 
-- `common/`
-  - 공통 설정, metric, loss, util, feature schema
-- `candidate/`
-  - Two-Tower 기반 후보 생성 모델
-- `ranking/`
-  - DeepFM 기반 랭킹 모델
-- `session/`
-  - 세션 기반 단기 관심 인코딩
-- `serving/`
-  - API 서버에서 사용할 추천 추론 로직
-- `checkpoints/`
-  - 학습된 모델 가중치 저장
+### `rec_models`의 역할
 
-## 전체 파이프라인
+`rec_models` 서비스는 사용자 요청에 대해 최종 추천 결과를 생성하는 역할을 담당합니다.
 
-1. User / Item feature 구성
-2. Two-Tower로 candidate item top-k 추출
-3. Ranking 모델로 후보 재정렬
-4. 필요 시 session feature 반영
-5. 최종 추천 결과 반환
+주요 책임은 다음과 같습니다.
 
-## 주요 목표
-- Candidate Generation: Recall@300 개선
-- Ranking: AUC 개선
-- Serving: 빠른 inference 지원
+- 추천 후보군 생성
+- 랭킹 모델 기반 후보 점수화
+- 다양성, 신선도, 탐색을 반영한 리랭킹
+- 추천 이유와 지연 시간 정보를 포함한 API 응답 반환
+- 현재 추천 파이프라인에 대한 오프라인 평가 지원
+
+### 전체 추천 파이프라인
+
+현재 추천 서빙 흐름은 다음과 같습니다.
+
+1. Candidate Generation
+   - 상품 메타데이터, popularity, recent clicks, session interest를 활용해 후보군을 생성합니다.
+   - 사용자/세션 신호가 부족한 경우 popularity 기반 fallback을 사용합니다.
+2. Ranking
+   - `joblib`로 저장된 baseline ranking 모델로 후보군을 점수화합니다.
+   - 사용자 프로필 feature와 상품 메타데이터를 결합해 ranking feature를 구성합니다.
+3. Reranking
+   - 카테고리 다양성을 반영해 결과를 조정합니다.
+   - exploration slot을 삽입합니다.
+   - 필요 시 신상품/신선도 관련 boost를 적용합니다.
+4. Response
+   - 최종 추천 결과와 함께 `product_id`, `score`, `reason`, `is_exploration`, latency 정보를 반환합니다.
+
+요약하면 다음과 같습니다.
+
+```text
+Request
+  -> Candidate Generation
+  -> Ranking
+  -> Reranking
+  -> Final Recommendations API Response
+```
+
+## 2. 주요 기능
+
+### Candidate Generation
+
+- `serving/candidate_service.py`에 메타데이터 기반 candidate generation이 구현되어 있습니다.
+- popularity 기반 fallback candidate retrieval을 지원합니다.
+- 세션 기반 후보 확장을 지원합니다.
+  - `recent_clicks`
+  - `session_interest`
+- 최근 클릭한 아이템은 최종 candidate pool에서 제외합니다.
+- `candidate_reason`, popularity, freshness 관련 메타데이터를 함께 생성합니다.
+
+현재 candidate 단계에서 동작하는 주요 분기는 다음과 같습니다.
+
+- `cold_start_popularity`
+  - recent clicks와 session interest가 모두 없을 때 사용됩니다.
+- recent-click signal matching
+  - 최근 클릭 상품과의 category / main category / color 유사도를 활용합니다.
+- session-interest matching
+  - 세션 관심도 가중치를 category 단위로 반영합니다.
+
+### Ranking
+
+- `serving/ranking_service.py`에 baseline ranking inference가 구현되어 있습니다.
+- `checkpoints/ranking_baseline.joblib`에 저장된 sklearn pipeline을 로드합니다.
+- `joblib` artifact와 metadata를 함께 사용합니다.
+- 다음 feature를 결합해 ranking input을 구성합니다.
+  - customer profile features
+  - item metadata
+  - engineered cross features
+- 사용자 feature가 없는 경우 cold-start-safe default 값을 사용합니다.
+
+### Reranking
+
+- `serving/rerank_bridge.py`에 reranking 로직이 구현되어 있습니다.
+- 가능한 경우 동일 카테고리 아이템이 3개 연속 등장하지 않도록 diversity guard를 적용합니다.
+- ranking 결과 중 일부 위치에 exploration slot을 삽입합니다.
+- exploration 과정에서 fresh/new item boost를 적용할 수 있습니다.
+- ranking 단계가 실패하면 popularity 기반 정렬로 fallback합니다.
+
+현재 적용된 reranking 기능은 다음과 같습니다.
+
+- diversity control
+- exploration slot injection
+- freshness fallback / new item boost
+- epsilon-greedy exploration policy
+
+### `reason` 필드 분기
+
+최종 추천 결과에는 `reason` 필드가 포함됩니다. 현재 사용 중인 분기는 다음과 같습니다.
+
+- `recent_click_similarity`
+- `session_interest_match`
+- `cold_start_popularity`
+- `ranking_score`
+- `new_item_boost`
+- `mab_exploration`
+
+### Latency 측정
+
+각 요청에 대해 파이프라인 단계별 latency를 측정해 반환합니다.
+
+- `candidate_ms`
+- `ranking_ms`
+- `reranking_ms`
+- `total_ms`
+
+### API 서버
+
+구현된 엔드포인트는 다음과 같습니다.
+
+- `GET /recommend`
+- `POST /session/update`
+- `GET /health`
+- Swagger 문서: `/docs`
+
+### Evaluation CLI
+
+오프라인 평가는 `evaluation/evaluate_recommender.py`에 구현되어 있습니다.
+
+지원하는 지표는 다음과 같습니다.
+
+- `HitRate@K`
+- `NDCG@K`
+- `Coverage@K`
+
+추가로 다음 기능도 지원합니다.
+
+- cold-start subset 평가
+- popularity baseline 비교
+- JSON 결과 저장
+
+### Docker 단독 실행
+
+- `rec_models`는 단독 Docker 서비스로 실행할 수 있습니다.
+- 현재 Docker 이미지에는 FastAPI 서버와 서빙에 필요한 모델/데이터 artifact가 포함됩니다.
+
+## 3. 디렉토리 구조
+
+`rec_models`의 주요 디렉토리는 다음과 같습니다.
+
+```text
+rec_models/
+├── serving/
+├── ranking/
+├── evaluation/
+├── checkpoints/
+└── data/processed/
+```
+
+### `serving/`
+
+추천 서빙 시점의 핵심 로직이 들어 있습니다.
+
+- `candidate_service.py`
+  - candidate generation 로직
+- `ranking_service.py`
+  - ranking inference 및 feature 구성
+- `rerank_bridge.py`
+  - diversity, exploration, freshness 기반 reranking
+- `recommend_service.py`
+  - candidate -> ranking -> reranking 전체 orchestration
+
+### `ranking/`
+
+랭킹 모델 학습 및 추론 관련 유틸리티가 포함됩니다.
+
+- dataset preparation
+- model training
+- offline ranking inference helpers
+- ranking model evaluator utilities
+
+### `evaluation/`
+
+추천 서비스 오프라인 평가 도구가 포함됩니다.
+
+- serving pipeline evaluation CLI
+- recommendation metrics
+- popularity baseline comparison
+
+### `checkpoints/`
+
+학습된 모델 artifact와 metadata를 저장합니다.
+
+- `ranking_baseline.joblib`
+  - 서빙에 사용하는 baseline ranking pipeline
+- `ranking_baseline_metadata.json`
+  - ranking pipeline과 함께 사용하는 feature metadata
+- `two_tower.pt`
+  - candidate 모델 checkpoint
+- `deepfm.pt`
+  - ranking 모델 checkpoint
+
+### `data/processed/`
+
+서빙 및 평가에 사용하는 전처리 결과 파일이 들어 있습니다.
+
+- `articles_feature.csv`
+  - 상품/아이템 메타데이터
+- `customer_features.csv`
+  - 사용자 프로필 feature
+- `item_features.csv`
+  - popularity 등 item-level feature
+
+## 4. 실행 방법
+
+### 4.1 로컬 실행
+
+레포지토리 루트에서 터미널을 열고 실행합니다.
+
+- 권장 환경
+  - WSL terminal
+  - VSCode integrated terminal
+
+프로젝트 루트 기준 실행:
+
+```bash
+cd /home/jiwon/projects/multimodal-search-engine
+python -m venv .venv
+source .venv/bin/activate
+pip install -r rec_models/requirements.txt
+python -m uvicorn rec_models.app:app --host 0.0.0.0 --port 8003
+```
+
+서버 주소:
+
+```text
+http://localhost:8003
+```
+
+API 문서:
+
+```text
+http://localhost:8003/docs
+```
+
+### 4.2 Docker 실행
+
+레포지토리 루트에서 아래 명령으로 빌드 및 실행합니다.
+
+```bash
+cd /home/jiwon/projects/multimodal-search-engine
+docker build -t rec-models ./rec_models
+docker run --rm -p 8003:8003 rec-models
+```
+
+실행 후 접속 주소:
+
+```text
+http://localhost:8003
+http://localhost:8003/docs
+```
+
+## 5. API 사용 방법
+
+### `GET /recommend`
+
+사용자에 대한 추천 결과를 반환합니다.
+
+Query parameter:
+
+- `user_id` (required)
+- `top_n` (optional, default: `10`)
+- `recent_clicks` (optional, comma-separated article ids)
+- `click_count` (optional, default: `0`)
+- `session_interest` (optional, JSON string)
+
+예시 요청:
+
+```bash
+curl "http://localhost:8003/recommend?user_id=12345&top_n=10&recent_clicks=0108775015,0751471001&click_count=2&session_interest=%7B%22Dresses%22%3A0.8%2C%22Tops%22%3A0.4%7D"
+```
+
+예시 응답 형태:
+
+```json
+{
+  "user_id": "12345",
+  "recommendations": [
+    {
+      "product_id": "0751471001",
+      "score": 0.9132,
+      "reason": "recent_click_similarity",
+      "is_exploration": false
+    },
+    {
+      "product_id": "0861234002",
+      "score": 0.8411,
+      "reason": "new_item_boost",
+      "is_exploration": true
+    }
+  ],
+  "pipeline_latency": {
+    "candidate_ms": 85,
+    "ranking_ms": 41,
+    "reranking_ms": 3,
+    "total_ms": 129
+  },
+  "session_context": {
+    "recent_clicks": ["0108775015", "0751471001"],
+    "session_interest": {
+      "Dresses": 0.8,
+      "Tops": 0.4
+    }
+  }
+}
+```
+
+### `POST /session/update`
+
+향후 session-event 연동을 위한 placeholder 엔드포인트입니다.
+
+예시 요청:
+
+```bash
+curl -X POST "http://localhost:8003/session/update" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "12345",
+    "item_id": "0751471001",
+    "event": "click"
+  }'
+```
+
+예시 응답:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### `GET /health`
+
+서버 상태 확인용 health check 엔드포인트입니다.
+
+예시 요청:
+
+```bash
+curl "http://localhost:8003/health"
+```
+
+예시 응답:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### Interactive API Docs
+
+서버가 실행 중이면 아래 주소에서 Swagger UI를 확인할 수 있습니다.
+
+```text
+http://localhost:8003/docs
+```
+
+## 6. Evaluation 방법
+
+### CLI 실행
+
+레포지토리 루트에서 아래 명령으로 오프라인 평가를 실행합니다.
+
+```bash
+python -m rec_models.evaluation.evaluate_recommender \
+  --data rec_models/data/processed/test_recommendation_data.csv \
+  --top_k 50
+```
+
+추가 예시는 다음과 같습니다.
+
+```bash
+python -m rec_models.evaluation.evaluate_recommender \
+  --data rec_models/data/processed/test_recommendation_data.csv \
+  --top_k 50 \
+  --max-users 500 \
+  --output-json rec_models/evaluation/results.json
+```
+
+```bash
+python -m rec_models.evaluation.evaluate_recommender \
+  --data rec_models/data/processed/test_recommendation_data.csv \
+  --top_k 50 \
+  --skip-popularity-baseline
+```
+
+### 지표 설명
+
+- `HitRate@K`
+  - 상위 `K`개 추천 안에 relevant item이 하나라도 포함되는지 측정합니다.
+- `NDCG@K`
+  - relevant item이 상위에 올수록 더 높은 점수를 주는 ranking 품질 지표입니다.
+- `Coverage@K`
+  - 추천 결과가 전체 candidate item 공간을 얼마나 넓게 사용하는지 측정합니다.
+
+### Popularity Baseline 비교
+
+Evaluation CLI는 현재 serving pipeline과 popularity-only baseline을 같은 candidate set 위에서 비교할 수 있습니다.
+
+이를 통해 다음을 확인할 수 있습니다.
+
+- ranking + reranking이 relevance를 실제로 개선하는지
+- diversity / exploration이 coverage에 어떤 영향을 주는지
+- cold-start 상황에서 popularity-only 정렬보다 나은지
+
+CLI는 다음 결과를 함께 출력합니다.
+
+- current model metrics
+- cold-start subset metrics
+- popularity baseline metrics
+- improvement versus popularity baseline
+
+## 7. 현재 한계
+
+- candidate 단계 latency가 아직 높아 production 수준 최적화가 필요합니다.
+- popularity 중심 candidate pool 특성상 coverage가 아직 낮습니다.
+- cold-start subset 크기가 충분하지 않아 해석이 불안정할 수 있습니다.
+- 데이터셋 구조와 positive label 추론 방식 때문에 평가 편향이 발생할 수 있습니다.
+- `/session/update`는 아직 placeholder이며 session persistence가 구현되어 있지 않습니다.
+- exploration은 아직 heuristic 기반이며 실제 contextual bandit 수준은 아닙니다.
+
+## 8. TODO
+
+- candidate stage를 최적화해 latency를 `200ms` 이하로 낮추기
+- reranking 및 candidate diversity 전략 개선으로 coverage 향상
+- popularity fallback을 넘어서는 cold-start 전략 고도화
+- epsilon-greedy 기반 exploration을 bandit 기반 정책으로 업그레이드
+- user embedding / item embedding 등 feature 추가
+- train/test split 전략 개선으로 offline evaluation 신뢰도 향상
+- volume mount 또는 external storage 기반 대용량 데이터 처리 개선
+- `docker-compose` 기반 전체 서비스 통합
+
+## Current Status Summary
+
+- FastAPI 기반 추천 API 서버가 구현되어 있습니다.
+- candidate generation, ranking, reranking이 end-to-end로 연결되어 있습니다.
+- 오프라인 evaluation CLI에서 HitRate, NDCG, Coverage 및 popularity baseline 비교를 지원합니다.
+- Docker standalone 실행이 가능하며 포트는 `8003`을 사용합니다.
+- 다음 우선 과제는 latency 최적화, coverage 개선, cold-start 및 exploration 고도화입니다.
