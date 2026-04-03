@@ -210,7 +210,9 @@ __marimo__/
 # Data (large / local only)
 # ========================
 data/raw_data/
-#data/processed/#
+data/raw
+data/processed/
+rec_models/data/processed/
 
 # ========================
 # Local config

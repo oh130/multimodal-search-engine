@@ -1,0 +1,379 @@
+"""Offline evaluation CLI for the recommendation serving pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+try:
+    from rec_models.evaluation.metrics import coverage_at_k, hit_rate_at_k, mean_metric, ndcg_at_k
+    from rec_models.serving.candidate_service import load_article_catalog, normalize_article_id
+    from rec_models.serving.recommend_service import rank_candidates_to_recommendations
+    from rec_models.serving.ranking_service import load_customer_features
+except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
+    from evaluation.metrics import coverage_at_k, hit_rate_at_k, mean_metric, ndcg_at_k  # type: ignore[no-redef]
+    from serving.candidate_service import load_article_catalog, normalize_article_id  # type: ignore[no-redef]
+    from serving.recommend_service import rank_candidates_to_recommendations  # type: ignore[no-redef]
+    from serving.ranking_service import load_customer_features  # type: ignore[no-redef]
+
+
+DEFAULT_TOP_K = 50
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate the recommendation pipeline offline.")
+    parser.add_argument("--data", type=Path, required=True, help="Path to processed recommendation test data.")
+    parser.add_argument("--top_k", type=int, default=DEFAULT_TOP_K, help="Cutoff K for ranking metrics.")
+    parser.add_argument("--output-json", type=Path, help="Optional output path for JSON metrics.")
+    parser.add_argument("--max-users", type=int, help="Optional cap for smoke checks or faster iteration.")
+    parser.add_argument(
+        "--skip-popularity-baseline",
+        action="store_true",
+        help="Skip the popularity baseline comparison.",
+    )
+    return parser.parse_args()
+
+
+def load_evaluation_data(data_path: Path) -> pd.DataFrame:
+    """Load and normalize evaluation data."""
+
+    resolved_path = data_path.expanduser().resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Evaluation data not found: {resolved_path}")
+
+    data = pd.read_csv(resolved_path)
+    required_columns = {"customer_id", "article_id"}
+    missing_columns = required_columns - set(data.columns)
+    if missing_columns:
+        raise ValueError(f"Evaluation data is missing required columns: {sorted(missing_columns)}")
+
+    data["customer_id"] = data["customer_id"].astype(str)
+    data["article_id"] = data["article_id"].map(normalize_article_id)
+    return data
+
+
+def infer_positive_mask(data: pd.DataFrame) -> pd.Series:
+    """Infer positive interactions from common processed-data conventions."""
+
+    if "label" in data.columns:
+        return pd.to_numeric(data["label"], errors="coerce").fillna(0).eq(1)
+
+    for column in ("is_positive", "target", "clicked", "purchased"):
+        if column in data.columns:
+            return data[column].astype(str).str.lower().isin({"1", "true", "yes"})
+
+    if "ground_truth_article_id" in data.columns:
+        return data["article_id"].astype(str).eq(data["ground_truth_article_id"].map(normalize_article_id))
+
+    if "sales_channel_id" in data.columns:
+        return pd.to_numeric(data["sales_channel_id"], errors="coerce").fillna(-1).ne(-1)
+
+    raise ValueError(
+        "Could not infer positive rows. Expected one of: label, is_positive, target, "
+        "clicked, purchased, ground_truth_article_id, or sales_channel_id."
+    )
+
+
+def enrich_candidate_rows(data: pd.DataFrame) -> pd.DataFrame:
+    """Attach serving-time metadata such as popularity to evaluation candidates."""
+
+    catalog = load_article_catalog().copy()
+    merge_columns = [
+        column
+        for column in ("article_id", "popularity", "item_age_days", "is_new_item", "category", "main_category", "color")
+        if column in catalog.columns
+    ]
+    enriched = data.merge(catalog.loc[:, merge_columns].drop_duplicates("article_id"), on="article_id", how="left", suffixes=("", "_catalog"))
+
+    for column in ("category", "main_category", "color"):
+        catalog_column = f"{column}_catalog"
+        if column not in enriched.columns and catalog_column in enriched.columns:
+            enriched[column] = enriched[catalog_column]
+        elif catalog_column in enriched.columns:
+            enriched[column] = enriched[column].fillna(enriched[catalog_column])
+
+    if "popularity" not in enriched.columns:
+        enriched["popularity"] = 0.0
+    enriched["popularity"] = pd.to_numeric(enriched["popularity"], errors="coerce").fillna(0.0)
+
+    if "item_age_days" not in enriched.columns:
+        enriched["item_age_days"] = pd.NA
+    if "is_new_item" not in enriched.columns:
+        enriched["is_new_item"] = False
+
+    return enriched
+
+
+def build_ground_truth_by_user(data: pd.DataFrame, positive_mask: pd.Series) -> dict[str, list[str]]:
+    """Build user -> positive article ids."""
+
+    positives = data.loc[positive_mask, ["customer_id", "article_id"]].drop_duplicates()
+    grouped = positives.groupby("customer_id", sort=False)["article_id"].apply(list)
+    return grouped.to_dict()
+
+
+def build_cold_start_user_set(user_ids: list[str]) -> set[str]:
+    """Identify users missing from serving-time customer features."""
+
+    customer_features = load_customer_features()
+    if customer_features.empty or "customer_id" not in customer_features.columns:
+        return set()
+
+    known_users = set(customer_features["customer_id"].astype(str))
+    return {user_id for user_id in user_ids if user_id not in known_users}
+
+
+def build_session_context(user_rows: pd.DataFrame) -> dict[str, Any]:
+    """Extract serving-compatible session context from optional evaluation columns."""
+
+    recent_clicks: list[str] = []
+    session_interest: Any = None
+
+    if "recent_clicks" in user_rows.columns:
+        raw_value = user_rows["recent_clicks"].dropna().astype(str).head(1)
+        if not raw_value.empty:
+            recent_clicks = [normalize_article_id(item_id) for item_id in raw_value.iloc[0].split(",") if item_id.strip()]
+
+    if "session_interest" in user_rows.columns:
+        raw_interest = user_rows["session_interest"].dropna().head(1)
+        if not raw_interest.empty:
+            session_interest = raw_interest.iloc[0]
+
+    return {
+        "recent_clicks": recent_clicks,
+        "session_interest": session_interest,
+    }
+
+
+def popularity_recommendations(user_rows: pd.DataFrame, top_k: int) -> list[str]:
+    """Return a popularity-only baseline ranking for one user's candidates."""
+
+    if user_rows.empty or top_k <= 0:
+        return []
+
+    ordered = user_rows.copy()
+    ordered["popularity"] = pd.to_numeric(ordered.get("popularity"), errors="coerce").fillna(0.0)
+    ordered = ordered.sort_values(["popularity", "article_id"], ascending=[False, True]).head(top_k)
+    return ordered["article_id"].astype(str).tolist()
+
+
+def compute_metric_summary(
+    ranked_lists: list[list[str]],
+    relevant_lists: list[list[str]],
+    total_candidate_count: int,
+    k: int,
+    evaluated_users: int,
+) -> dict[str, Any]:
+    """Aggregate ranking metrics into one summary."""
+
+    return {
+        "users_evaluated": evaluated_users,
+        f"HitRate@{k}": mean_metric(ranked_lists, relevant_lists, hit_rate_at_k, k),
+        f"NDCG@{k}": mean_metric(ranked_lists, relevant_lists, ndcg_at_k, k),
+        f"Coverage@{k}": coverage_at_k(ranked_lists, total_candidate_count=total_candidate_count, k=k),
+    }
+
+
+def evaluate_recommender(
+    data: pd.DataFrame,
+    top_k: int,
+    max_users: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate the current serving ranking+rerranking pipeline."""
+
+    positive_mask = infer_positive_mask(data)
+    ground_truth_by_user = build_ground_truth_by_user(data, positive_mask)
+    user_ids = list(ground_truth_by_user.keys())
+    if max_users is not None:
+        user_ids = user_ids[:max_users]
+
+    cold_start_users = build_cold_start_user_set(user_ids)
+    total_candidate_count = int(data["article_id"].nunique())
+
+    ranked_lists: list[list[str]] = []
+    relevant_lists: list[list[str]] = []
+    cold_ranked_lists: list[list[str]] = []
+    cold_relevant_lists: list[list[str]] = []
+
+    for user_id in user_ids:
+        user_rows = data.loc[data["customer_id"].eq(user_id)].copy()
+        if user_rows.empty:
+            continue
+
+        session_context = build_session_context(user_rows)
+        recommendations = rank_candidates_to_recommendations(
+            user_id=user_id,
+            candidate_items=user_rows,
+            top_n=top_k,
+            session_context=session_context,
+        )
+        ranked_items = [str(item["product_id"]) for item in recommendations]
+        relevant_items = ground_truth_by_user[user_id]
+
+        ranked_lists.append(ranked_items)
+        relevant_lists.append(relevant_items)
+        if user_id in cold_start_users:
+            cold_ranked_lists.append(ranked_items)
+            cold_relevant_lists.append(relevant_items)
+
+    result = compute_metric_summary(
+        ranked_lists=ranked_lists,
+        relevant_lists=relevant_lists,
+        total_candidate_count=total_candidate_count,
+        k=top_k,
+        evaluated_users=len(ranked_lists),
+    )
+    result["cold_start_subset"] = compute_metric_summary(
+        ranked_lists=cold_ranked_lists,
+        relevant_lists=cold_relevant_lists,
+        total_candidate_count=total_candidate_count,
+        k=top_k,
+        evaluated_users=len(cold_ranked_lists),
+    )
+    return result
+
+
+def evaluate_popularity_baseline(
+    data: pd.DataFrame,
+    top_k: int,
+    max_users: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate a popularity-only baseline on the same user candidate sets."""
+
+    positive_mask = infer_positive_mask(data)
+    ground_truth_by_user = build_ground_truth_by_user(data, positive_mask)
+    user_ids = list(ground_truth_by_user.keys())
+    if max_users is not None:
+        user_ids = user_ids[:max_users]
+
+    cold_start_users = build_cold_start_user_set(user_ids)
+    total_candidate_count = int(data["article_id"].nunique())
+
+    ranked_lists: list[list[str]] = []
+    relevant_lists: list[list[str]] = []
+    cold_ranked_lists: list[list[str]] = []
+    cold_relevant_lists: list[list[str]] = []
+
+    for user_id in user_ids:
+        user_rows = data.loc[data["customer_id"].eq(user_id)].copy()
+        if user_rows.empty:
+            continue
+
+        ranked_items = popularity_recommendations(user_rows=user_rows, top_k=top_k)
+        relevant_items = ground_truth_by_user[user_id]
+
+        ranked_lists.append(ranked_items)
+        relevant_lists.append(relevant_items)
+        if user_id in cold_start_users:
+            cold_ranked_lists.append(ranked_items)
+            cold_relevant_lists.append(relevant_items)
+
+    result = compute_metric_summary(
+        ranked_lists=ranked_lists,
+        relevant_lists=relevant_lists,
+        total_candidate_count=total_candidate_count,
+        k=top_k,
+        evaluated_users=len(ranked_lists),
+    )
+    result["cold_start_subset"] = compute_metric_summary(
+        ranked_lists=cold_ranked_lists,
+        relevant_lists=cold_relevant_lists,
+        total_candidate_count=total_candidate_count,
+        k=top_k,
+        evaluated_users=len(cold_ranked_lists),
+    )
+    return result
+
+
+def build_comparison_summary(
+    ranking_metrics: dict[str, Any],
+    baseline_metrics: dict[str, Any] | None,
+    top_k: int,
+) -> dict[str, Any]:
+    """Add lift numbers when the popularity baseline is available."""
+
+    summary = {"current_model": ranking_metrics}
+    if baseline_metrics is None:
+        return summary
+
+    hit_key = f"HitRate@{top_k}"
+    ndcg_key = f"NDCG@{top_k}"
+    coverage_key = f"Coverage@{top_k}"
+    summary["popularity_baseline"] = baseline_metrics
+    summary["improvement_vs_popularity"] = {
+        hit_key: ranking_metrics[hit_key] - baseline_metrics[hit_key],
+        ndcg_key: ranking_metrics[ndcg_key] - baseline_metrics[ndcg_key],
+        coverage_key: ranking_metrics[coverage_key] - baseline_metrics[coverage_key],
+    }
+    return summary
+
+
+def _format_metric_line(label: str, value: float) -> str:
+    return f"{label:<18} {value:.6f}"
+
+
+def print_evaluation_report(results: dict[str, Any], top_k: int) -> None:
+    """Pretty-print evaluation metrics to the console."""
+
+    hit_key = f"HitRate@{top_k}"
+    ndcg_key = f"NDCG@{top_k}"
+    coverage_key = f"Coverage@{top_k}"
+
+    current = results["current_model"]
+    print("Current Model")
+    print(f"{'users evaluated':<18} {current['users_evaluated']}")
+    print(_format_metric_line(hit_key, current[hit_key]))
+    print(_format_metric_line(ndcg_key, current[ndcg_key]))
+    print(_format_metric_line(coverage_key, current[coverage_key]))
+
+    cold = current["cold_start_subset"]
+    print("\nCold Start Subset")
+    print(f"{'users evaluated':<18} {cold['users_evaluated']}")
+    print(_format_metric_line(hit_key, cold[hit_key]))
+    print(_format_metric_line(ndcg_key, cold[ndcg_key]))
+    print(_format_metric_line(coverage_key, cold[coverage_key]))
+
+    baseline = results.get("popularity_baseline")
+    if baseline is not None:
+        print("\nPopularity Baseline")
+        print(f"{'users evaluated':<18} {baseline['users_evaluated']}")
+        print(_format_metric_line(hit_key, baseline[hit_key]))
+        print(_format_metric_line(ndcg_key, baseline[ndcg_key]))
+        print(_format_metric_line(coverage_key, baseline[coverage_key]))
+
+        improvement = results["improvement_vs_popularity"]
+        print("\nImprovement vs Popularity")
+        print(_format_metric_line(hit_key, improvement[hit_key]))
+        print(_format_metric_line(ndcg_key, improvement[ndcg_key]))
+        print(_format_metric_line(coverage_key, improvement[coverage_key]))
+
+
+def main() -> None:
+    args = parse_args()
+
+    data = enrich_candidate_rows(load_evaluation_data(args.data))
+    ranking_metrics = evaluate_recommender(data=data, top_k=args.top_k, max_users=args.max_users)
+    baseline_metrics = None
+    if not args.skip_popularity_baseline:
+        baseline_metrics = evaluate_popularity_baseline(data=data, top_k=args.top_k, max_users=args.max_users)
+
+    results = build_comparison_summary(
+        ranking_metrics=ranking_metrics,
+        baseline_metrics=baseline_metrics,
+        top_k=args.top_k,
+    )
+    print_evaluation_report(results, top_k=args.top_k)
+
+    if args.output_json is not None:
+        output_path = args.output_json.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"\nSaved JSON metrics to {output_path}")
+
+
+if __name__ == "__main__":
+    main()

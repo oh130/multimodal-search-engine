@@ -1,7 +1,7 @@
 import pandas as pd
 
 # 1) transactions 데이터 일부만 읽기
-df = pd.read_csv("transactions_train.csv", nrows=100000)
+df = pd.read_csv("../data/raw/transactions_train.csv", nrows=100000)
 
 # 2) 날짜 형식 변환
 df["t_dat"] = pd.to_datetime(df["t_dat"])
@@ -25,7 +25,7 @@ item_price.columns = ["article_id", "item_price"]
 item_feat = item_popularity.merge(item_price, on="article_id")
 
 # 5) csv로 저장
-user_feat.to_csv("user_features.csv", index=False)
-item_feat.to_csv("item_features.csv", index=False)
+user_feat.to_csv("../data/processed/user_features.csv", index=False)
+item_feat.to_csv("../data/processed/item_features.csv", index=False)
 
 print("완료")

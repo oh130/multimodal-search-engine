@@ -1,12 +1,88 @@
-"""
-추천 전용 FastAPI 서버 진입점 위치.
+"""FastAPI entrypoint for the recommendation service."""
 
-역할:
-- 외부 요청을 받아 추천 파이프라인을 호출하는 API 서버 시작점을 담당한다.
-- serving 계층의 recommend_service를 HTTP 인터페이스와 연결한다.
+from __future__ import annotations
 
-작성 지침:
-- 모델 구현 로직을 이 파일에 직접 넣지 않고 serving 모듈 호출에 집중한다.
-- 요청 스키마, 응답 스키마, health check 같은 API 레벨 책임만 둔다.
-- 포트, 환경변수, 초기화 절차는 서비스 실행 관점에서 명확히 분리한다.
-"""
+import json
+import logging
+from typing import Any
+
+from fastapi import FastAPI, Query
+from pydantic import BaseModel
+
+try:
+    from rec_models.serving.recommend_service import recommend
+except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
+    from serving.recommend_service import recommend  # type: ignore[no-redef]
+
+
+LOGGER = logging.getLogger(__name__)
+app = FastAPI(title="Recommendation Models Service")
+
+
+class SessionUpdateRequest(BaseModel):
+    user_id: str
+    item_id: str
+    event: str
+
+
+def _parse_recent_clicks(raw_recent_clicks: str | None) -> list[str]:
+    if not raw_recent_clicks:
+        return []
+    return [value.strip() for value in raw_recent_clicks.split(",") if value.strip()]
+
+
+def _parse_session_interest(raw_session_interest: str | None) -> dict[str, Any] | None:
+    if not raw_session_interest:
+        return None
+
+    try:
+        parsed = json.loads(raw_session_interest)
+    except json.JSONDecodeError:
+        LOGGER.warning("Failed to parse session_interest JSON. Ignoring value.")
+        return None
+
+    if isinstance(parsed, dict):
+        return parsed
+    LOGGER.warning("session_interest must be a JSON object. Ignoring value.")
+    return None
+
+
+@app.get("/recommend")
+def recommend_endpoint(
+    user_id: str = Query(...),
+    top_n: int = Query(10, ge=1, le=100),
+    recent_clicks: str | None = Query(None),
+    click_count: int = Query(0, ge=0),
+    session_interest: str | None = Query(None),
+) -> dict[str, Any]:
+    """Return ranked recommendations for one user."""
+
+    return recommend(
+        user_id=user_id,
+        top_n=top_n,
+        recent_clicks=_parse_recent_clicks(recent_clicks),
+        click_count=click_count,
+        session_interest=_parse_session_interest(session_interest),
+    )
+
+
+@app.post("/session/update")
+def session_update(_: SessionUpdateRequest) -> dict[str, str]:
+    """Placeholder endpoint for session-event integration.
+
+    TODO: Persist session updates inside rec_models once a dedicated session
+    feature backend is introduced.
+    """
+
+    return {"status": "ok"}
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8003, reload=False)

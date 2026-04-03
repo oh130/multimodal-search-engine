@@ -1,7 +1,7 @@
 import csv
 
-input_file = "articles.csv"
-output_file = "articles_extract_feature.csv"
+input_file = "../data/raw/articles.csv"
+output_file = "../data/processed/articles_extract_feature.csv"
 
 with open(input_file, newline="", encoding="utf-8") as infile, \
      open(output_file, "w", newline="", encoding="utf-8") as outfile:

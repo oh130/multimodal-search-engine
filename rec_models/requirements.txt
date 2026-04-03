@@ -1,3 +1,7 @@
-# 추천 서버 및 모델 모듈 의존성 정리 위치.
-# 예: fastapi, uvicorn, torch 또는 tensorflow, scikit-learn
-# 현재는 구조만 맞추는 단계이므로 실제 패키지 목록은 추후 확정한다.
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.7.0,<3.0.0
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.5.0
+joblib>=1.4.0
