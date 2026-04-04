@@ -9,12 +9,12 @@ from typing import Any
 import pandas as pd
 
 try:
-    from rec_models.serving.candidate_service import generate_candidates
-    from rec_models.serving.ranking_service import score_candidates
+    from rec_models.serving.candidate_service import generate_candidates, load_serving_artifacts
+    from rec_models.serving.ranking_service import load_customer_features, load_ranking_pipeline, score_candidates
     from rec_models.serving.rerank_bridge import rerank_recommendations
 except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
-    from serving.candidate_service import generate_candidates  # type: ignore[no-redef]
-    from serving.ranking_service import score_candidates  # type: ignore[no-redef]
+    from serving.candidate_service import generate_candidates, load_serving_artifacts  # type: ignore[no-redef]
+    from serving.ranking_service import load_customer_features, load_ranking_pipeline, score_candidates  # type: ignore[no-redef]
     from serving.rerank_bridge import rerank_recommendations  # type: ignore[no-redef]
 
 
@@ -38,6 +38,16 @@ def _build_popularity_fallback(scored_candidates: pd.DataFrame) -> pd.DataFrame:
 
 def _random_seed_from_context(user_id: str, session_context: dict[str, Any]) -> int:
     return hash((user_id, tuple(session_context["recent_clicks"][:5]), str(session_context["session_interest"]))) & 0xFFFFFFFF
+
+
+def warmup_recommendation_assets() -> None:
+    """Eagerly load heavy serving artifacts to reduce first-request latency."""
+
+    warmup_start = time.perf_counter()
+    load_serving_artifacts()
+    load_ranking_pipeline()
+    load_customer_features()
+    LOGGER.info("Warmup completed in %sms", _elapsed_ms(warmup_start))
 
 
 def rank_candidates_to_recommendations(

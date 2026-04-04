@@ -105,6 +105,17 @@ def _resolve_user_features(user_id: str) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=1)
+def get_ranking_feature_columns() -> tuple[str, ...]:
+    """Cache serving-time ranking feature columns derived from model metadata."""
+
+    _, metadata = load_ranking_pipeline()
+    feature_columns = tuple(column for column in metadata.get("feature_columns", []) if column not in LEAKAGE_COLUMNS)
+    if not feature_columns:
+        raise ValueError("Ranking metadata does not contain usable feature_columns.")
+    return feature_columns
+
+
 def build_ranking_features(
     user_id: str,
     candidate_items: pd.DataFrame,
@@ -117,46 +128,43 @@ def build_ranking_features(
     if candidate_items.empty:
         return pd.DataFrame()
 
-    _, metadata = load_ranking_pipeline()
-    feature_columns = [column for column in metadata.get("feature_columns", []) if column not in LEAKAGE_COLUMNS]
-    if not feature_columns:
-        raise ValueError("Ranking metadata does not contain usable feature_columns.")
-
+    feature_columns = list(get_ranking_feature_columns())
     user_features = _resolve_user_features(user_id)
-    ranking_rows: list[dict[str, Any]] = []
+    age_bucket = _safe_get_text(user_features.get("age_bucket"))
+    club_member_status = _safe_get_text(user_features.get("club_member_status"))
+    fashion_news_frequency = _safe_get_text(user_features.get("fashion_news_frequency"))
 
-    for candidate in candidate_items.to_dict(orient="records"):
-        category = _safe_get_text(candidate.get("category"))
-        color = _safe_get_text(candidate.get("color"))
-        age_bucket = _safe_get_text(user_features.get("age_bucket"))
-        club_member_status = _safe_get_text(user_features.get("club_member_status"))
-        fashion_news_frequency = _safe_get_text(user_features.get("fashion_news_frequency"))
+    safe_text_frame = candidate_items.reindex(
+        columns=[
+            "prod_name",
+            "product_type_name",
+            "product_group_name",
+            "colour_group_name",
+            "perceived_colour_master_name",
+            "department_name",
+            "section_name",
+            "garment_group_name",
+            "category",
+            "main_category",
+            "color",
+        ],
+        fill_value=DEFAULT_CATEGORICAL_VALUE,
+    ).copy()
+    for column in safe_text_frame.columns:
+        safe_text_frame[column] = safe_text_frame[column].map(_safe_get_text)
 
-        ranking_rows.append(
-            {
-                "age": user_features.get("age", DEFAULT_NUMERIC_VALUE),
-                "age_bucket": age_bucket,
-                "fashion_news_frequency": fashion_news_frequency,
-                "club_member_status": club_member_status,
-                "prod_name": _safe_get_text(candidate.get("prod_name")),
-                "product_type_name": _safe_get_text(candidate.get("product_type_name")),
-                "product_group_name": _safe_get_text(candidate.get("product_group_name")),
-                "colour_group_name": _safe_get_text(candidate.get("colour_group_name")),
-                "perceived_colour_master_name": _safe_get_text(candidate.get("perceived_colour_master_name")),
-                "department_name": _safe_get_text(candidate.get("department_name")),
-                "section_name": _safe_get_text(candidate.get("section_name")),
-                "garment_group_name": _safe_get_text(candidate.get("garment_group_name")),
-                "category": category,
-                "main_category": _safe_get_text(candidate.get("main_category")),
-                "color": color,
-                "age_category": f"{age_bucket}_{category}",
-                "age_color": f"{age_bucket}_{color}",
-                "member_category": f"{club_member_status}_{category}",
-                "fashion_category": f"{fashion_news_frequency}_{category}",
-            }
-        )
+    features = pd.DataFrame(index=candidate_items.index)
+    features["age"] = user_features.get("age", DEFAULT_NUMERIC_VALUE)
+    features["age_bucket"] = age_bucket
+    features["fashion_news_frequency"] = fashion_news_frequency
+    features["club_member_status"] = club_member_status
+    for column in safe_text_frame.columns:
+        features[column] = safe_text_frame[column]
 
-    features = pd.DataFrame(ranking_rows)
+    features["age_category"] = age_bucket + "_" + features["category"]
+    features["age_color"] = age_bucket + "_" + features["color"]
+    features["member_category"] = club_member_status + "_" + features["category"]
+    features["fashion_category"] = fashion_news_frequency + "_" + features["category"]
     return prepare_inference_features(features, feature_columns=feature_columns)
 
 

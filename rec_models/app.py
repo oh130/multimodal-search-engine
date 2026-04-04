@@ -10,9 +10,9 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 
 try:
-    from rec_models.serving.recommend_service import recommend
+    from rec_models.serving.recommend_service import recommend, warmup_recommendation_assets
 except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
-    from serving.recommend_service import recommend  # type: ignore[no-redef]
+    from serving.recommend_service import recommend, warmup_recommendation_assets  # type: ignore[no-redef]
 
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +45,13 @@ def _parse_session_interest(raw_session_interest: str | None) -> dict[str, Any] 
         return parsed
     LOGGER.warning("session_interest must be a JSON object. Ignoring value.")
     return None
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    """Preload serving artifacts so the first request does not pay I/O costs."""
+
+    warmup_recommendation_assets()
 
 
 @app.get("/recommend")
