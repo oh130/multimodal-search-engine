@@ -94,15 +94,7 @@ async def recommend(
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"rec-models 연결 실패: {e}")
 
-    rec_data = resp.json()
-
-    # 명세 필수 필드: session_context를 gateway에서 붙여줌
-    rec_data["session_context"] = {
-        "recent_clicks": features["recent_clicks"],
-        "session_interest": features["session_interest"],
-    }
-
-    return rec_data
+    return resp.json()
 
 
 @app.post("/api/events")
