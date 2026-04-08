@@ -1,7 +1,5 @@
-version: '3.8'
-
 services:
-  # 조장님 파트 (Gateway)
+  # 인프라 파트 (Gateway)
   api-gateway:
     build: ./api_gateway
     ports:
