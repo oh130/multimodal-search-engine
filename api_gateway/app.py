@@ -41,7 +41,7 @@ app = FastAPI(title="API Gateway", lifespan=lifespan)
 class SearchRequest(BaseModel):
     query: str = ""
     image_base64: str | None = None
-    top_k: int = 20
+    top_k: int = 10
 
 
 class EventRequest(BaseModel):
