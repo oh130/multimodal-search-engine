@@ -79,46 +79,6 @@ python data_embedding.py
 python search_engine.py
 ```
 
-## GitHub 업로드 절차
-
-모든 파일은 `search_engine` 브랜치에 커밋한다.
-
-### 1. 브랜치 생성 또는 이동
-
-```bash
-git checkout -b search_engine
-```
-
-이미 브랜치가 있다면:
-
-```bash
-git checkout search_engine
-```
-
-### 2. 파일 저장
-
-* 첫 번째 임베딩 코드 저장: `data_embedding.py`
-* 두 번째 FAISS 검색 엔진 코드 저장: `search_engine.py`
-* README 저장: `README.md`
-
-### 3. 변경 사항 추가
-
-```bash
-git add data_embedding.py search_engine.py README.md
-```
-
-### 4. 커밋
-
-```bash
-git commit -m "Implement CLIP embedding and FAISS HNSW search engine"
-```
-
-### 5. 브랜치 업로드
-
-```bash
-git push origin search_engine
-```
-
 ## 참고
 
 이 프로젝트는 검색 품질과 응답 속도를 함께 고려한 멀티모달 검색 시스템을 목표로 한다.

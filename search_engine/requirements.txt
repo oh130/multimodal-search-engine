@@ -1,0 +1,11 @@
+torch
+torchvision
+transformers
+faiss-cpu
+numpy
+pillow
+tqdm
+fastapi>=0.115.0
+uvicorn>=0.30.1
+python-multipart>=0.0.9
+pandas>=2.0.0
