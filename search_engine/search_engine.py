@@ -66,6 +66,13 @@ class SearchItem:
     metadata: Dict[str, Any]
 
 
+@dataclass
+class SearchResult:
+    item_id: str
+    score: float
+    metadata: Dict[str, Any]
+
+
 def encode_image_file(path: Path | str) -> Optional[Image.Image]:
     try:
         return Image.open(path).convert("RGB")
@@ -203,6 +210,49 @@ class OpenAIClipEmbedder:
             return self.embed_image(image), "image"
         return self.embed_text(text or ""), "text"
 
+    def project_external_embedding(self, embedding: np.ndarray, modality: str = "text") -> np.ndarray:
+        model, _, dim = self._require_components()
+        vector = np.asarray(embedding, dtype=np.float32)
+        if vector.size == 0:
+            return np.zeros(dim, dtype=np.float32)
+
+        if vector.ndim == 1 and vector.shape[0] == dim:
+            return self._normalize(vector)
+
+        if vector.ndim >= 2 and vector.shape[-1] == dim:
+            flattened = vector.reshape(-1, dim)
+            return self._normalize(flattened.mean(axis=0))
+
+        if modality == "image":
+            hidden_dim = int(getattr(model.config.vision_config, "hidden_size", dim))
+            projection = model.visual_projection
+        else:
+            hidden_dim = int(getattr(model.config.text_config, "hidden_size", dim))
+            projection = model.text_projection
+
+        if vector.ndim == 1 and vector.shape[0] == hidden_dim:
+            tensor = torch.from_numpy(vector).to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                projected = projection(tensor)
+                projected = torch.nn.functional.normalize(projected, dim=-1)
+            return self._normalize(projected[0].detach().cpu().numpy())
+
+        if vector.ndim >= 2 and vector.shape[-1] == hidden_dim:
+            flattened = vector.reshape(-1, hidden_dim)
+            pooled = flattened.mean(axis=0, dtype=np.float32)
+            tensor = torch.from_numpy(pooled).to(self.device).unsqueeze(0)
+            with torch.no_grad():
+                projected = projection(tensor)
+                projected = torch.nn.functional.normalize(projected, dim=-1)
+            return self._normalize(projected[0].detach().cpu().numpy())
+
+        flattened = vector.reshape(-1).astype(np.float32)
+        if flattened.shape[0] > dim:
+            flattened = flattened[:dim]
+        elif flattened.shape[0] < dim:
+            flattened = np.pad(flattened, (0, dim - flattened.shape[0]))
+        return self._normalize(flattened)
+
 
 class MultimodalSearchEngine:
     """OpenAI CLIP + FAISS(HNSW) based multimodal search engine."""
@@ -219,9 +269,11 @@ class MultimodalSearchEngine:
         self.top_k_default = int(top_k_default)
         self.embedder = OpenAIClipEmbedder(model_name=clip_model_name)
         self.items: List[SearchItem] = []
+        self.item_ids: List[str] = []
         self._embeddings: Optional[np.ndarray] = None
         self.index: Any = None
         self.dimension = int(self.embedder.dim or 512)
+        self._is_built = False
 
         if self.mode == "production":
             self.items = self._load_production_items()
@@ -457,6 +509,7 @@ class MultimodalSearchEngine:
         self._embeddings = np.vstack(vectors).astype(np.float32)
         self._normalize_matrix_inplace(self._embeddings)
         self.dimension = int(self._embeddings.shape[1])
+        self.item_ids = [str(item.product_id) for item in self.items]
 
         if faiss is not None:
             self.index = faiss.IndexHNSWFlat(self.dimension, 32, faiss.METRIC_INNER_PRODUCT)
@@ -468,6 +521,64 @@ class MultimodalSearchEngine:
             self.index = _NumpyInnerProductIndex(self.dimension)
             self.index.add(self._embeddings)
             LOGGER.warning("FAISS unavailable, using NumPy fallback index with %d items", len(self.items))
+        self._is_built = True
+
+    def build_index(
+        self,
+        embeddings: np.ndarray,
+        item_ids: Optional[Sequence[Any]] = None,
+        metadatas: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> None:
+        vectors = np.asarray(embeddings, dtype=np.float32)
+        if vectors.ndim < 2:
+            raise ValueError("embeddings must be at least a 2D array")
+        if vectors.shape[0] == 0:
+            raise ValueError("embeddings must not be empty")
+
+        metadata_list = list(metadatas) if metadatas is not None else [{} for _ in range(vectors.shape[0])]
+        ids = list(item_ids) if item_ids is not None else list(range(vectors.shape[0]))
+        if len(ids) != vectors.shape[0] or len(metadata_list) != vectors.shape[0]:
+            raise ValueError("embeddings, item_ids, and metadatas must have the same length")
+
+        normalized_rows: List[np.ndarray] = []
+        for row, metadata in zip(vectors, metadata_list):
+            modality = "image" if str((metadata or {}).get("search_type", "")).lower() == "image" else "text"
+            normalized_rows.append(self.embedder.project_external_embedding(row, modality=modality))
+
+        self._embeddings = np.vstack(normalized_rows).astype(np.float32)
+        self._normalize_matrix_inplace(self._embeddings)
+        self.dimension = int(self._embeddings.shape[1])
+
+        self.items = []
+        self.item_ids = []
+        for idx, (item_id, metadata) in enumerate(zip(ids, metadata_list)):
+            payload = dict(metadata or {})
+            product_id = str(payload.get("product_id", item_id))
+            name = str(payload.get("name", product_id))
+            price = float(payload.get("price", 0.0))
+            description = str(payload.get("description", payload.get("prod_name", name)))
+            self.items.append(
+                SearchItem(
+                    product_id=product_id,
+                    name=name,
+                    price=price,
+                    description=description,
+                    image=None,
+                    metadata=payload,
+                )
+            )
+            self.item_ids.append(str(item_id))
+
+        if faiss is not None:
+            self.index = faiss.IndexHNSWFlat(self.dimension, 32, faiss.METRIC_INNER_PRODUCT)
+            self.index.hnsw.efConstruction = 200
+            self.index.hnsw.efSearch = 64
+            self.index.add(self._embeddings)
+        else:
+            self.index = _NumpyInnerProductIndex(self.dimension)
+            self.index.add(self._embeddings)
+        self._is_built = True
+        LOGGER.info("Built compatibility index with %d items", len(self.items))
 
     @staticmethod
     def _normalize_matrix_inplace(matrix: np.ndarray) -> None:
@@ -475,12 +586,68 @@ class MultimodalSearchEngine:
         norms[norms == 0] = 1.0
         matrix /= norms
 
+    def _search_from_vector(self, query_vec: np.ndarray, top_k: int) -> List[SearchResult]:
+        if self.index is None:
+            raise RuntimeError("Search index is not initialized")
+
+        query_vec = query_vec.astype(np.float32).reshape(1, -1)
+        if faiss is not None:
+            faiss.normalize_L2(query_vec)
+        else:
+            self._normalize_matrix_inplace(query_vec)
+
+        scores, indices = self.index.search(query_vec, top_k)
+
+        results: List[SearchResult] = []
+        for idx, score in zip(indices[0], scores[0]):
+            if idx < 0 or idx >= len(self.items):
+                continue
+            item = self.items[idx]
+            item_id = self.item_ids[idx] if idx < len(self.item_ids) else str(item.product_id)
+            results.append(SearchResult(item_id=str(item_id), score=float(score), metadata=dict(item.metadata)))
+        return results
+
+    def _prepare_query_vector(self, query_vec: np.ndarray, modality: str) -> np.ndarray:
+        vector = np.asarray(query_vec, dtype=np.float32)
+        if vector.size == 0:
+            return np.zeros(self.dimension, dtype=np.float32)
+        if vector.ndim == 1 and vector.shape[0] == self.dimension:
+            return self.embedder._normalize(vector)
+        if vector.ndim >= 2 and vector.shape[-1] == self.dimension:
+            flattened = vector.reshape(-1, self.dimension)
+            return self.embedder._normalize(flattened.mean(axis=0))
+        return self.embedder.project_external_embedding(vector, modality=modality)
+
     def search(
         self,
         query: Optional[str] = None,
         image: Optional[Image.Image] = None,
         top_k: Optional[int] = None,
-    ) -> Dict[str, Any]:
+        query_type: Optional[str] = None,
+        embedding: Optional[np.ndarray] = None,
+        text_embedding: Optional[np.ndarray] = None,
+        image_embedding: Optional[np.ndarray] = None,
+    ) -> Any:
+        if query_type is not None or embedding is not None or text_embedding is not None or image_embedding is not None:
+            top_k = max(1, int(top_k or self.top_k_default))
+            if query_type == "hybrid":
+                query_vec = self.embedder.combine_embeddings(
+                    [
+                        self._prepare_query_vector(text_embedding, "text") if text_embedding is not None else None,
+                        self._prepare_query_vector(image_embedding, "image") if image_embedding is not None else None,
+                    ]
+                )
+            elif query_type == "image":
+                source = image_embedding if image_embedding is not None else embedding
+                query_vec = self._prepare_query_vector(source, "image")
+            else:
+                source = text_embedding if text_embedding is not None else embedding
+                query_vec = self._prepare_query_vector(source, "text")
+
+            if query_vec.size == 0 or not np.any(query_vec):
+                return []
+            return self._search_from_vector(query_vec, top_k)
+
         if self.index is None:
             raise RuntimeError("Search index is not initialized")
 
@@ -494,27 +661,19 @@ class MultimodalSearchEngine:
                 "total_count": 0,
             }
 
-        query_vec = query_vec.astype(np.float32).reshape(1, -1)
-        if faiss is not None:
-            faiss.normalize_L2(query_vec)
-        else:
-            self._normalize_matrix_inplace(query_vec)
-
         started = time.perf_counter()
-        scores, indices = self.index.search(query_vec, top_k)
+        vector_results = self._search_from_vector(query_vec, top_k)
         latency_ms = (time.perf_counter() - started) * 1000.0
 
         results: List[Dict[str, Any]] = []
-        for idx, score in zip(indices[0], scores[0]):
-            if idx < 0 or idx >= len(self.items):
-                continue
-            item = self.items[idx]
+        for hit in vector_results:
+            meta = hit.metadata or {}
             results.append(
                 {
-                    "product_id": str(item.product_id),
-                    "name": item.name,
-                    "score": float(score),
-                    "price": float(item.price),
+                    "product_id": str(meta.get("product_id", hit.item_id)),
+                    "name": str(meta.get("name", "")),
+                    "score": float(hit.score),
+                    "price": float(meta.get("price", 0.0)),
                 }
             )
 
@@ -524,6 +683,9 @@ class MultimodalSearchEngine:
             "latency_ms": round(latency_ms, 3),
             "total_count": len(results),
         }
+
+    def __len__(self) -> int:
+        return len(self.items)
 
     def save_index(self, index_path: str, metadata_path: str) -> None:
         if self.index is None:
@@ -585,7 +747,6 @@ class MultimodalSearchEngine:
         obj._embeddings = None
         return obj
 
-
 def _configure_logging() -> None:
     if logging.getLogger().handlers:
         return
@@ -613,4 +774,3 @@ if __name__ == "__main__":
     for sample_query in _sample_queries(selected_mode):
         result = engine.search(query=sample_query, top_k=3)
         print(f"[search_engine] query={sample_query!r} -> {json.dumps(result, ensure_ascii=False)}")
-
