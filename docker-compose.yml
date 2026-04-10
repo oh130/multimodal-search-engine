@@ -19,6 +19,8 @@ services:
     build: ./search_engine
     ports:
       - "8002:8002"
+    environment:
+      - SEARCH_ENGINE_MODE=test
     volumes:
       - ./data:/app/data
 
