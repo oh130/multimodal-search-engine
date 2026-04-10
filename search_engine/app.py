@@ -1,4 +1,3 @@
-"""
 Search Engine API — port 8002
 
 엔드포인트:
@@ -24,7 +23,7 @@ from PIL import Image
 from pydantic import BaseModel
 from transformers import CLIPModel, CLIPProcessor
 
-from search_engine import MultimodalHNSWSearchEngine
+from search_engine import MultimodalSearchEngine
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,7 +34,7 @@ DATA_PATH = Path("/app/data/processed/articles_feature.csv")
 # 전역 객체
 clip_model: CLIPModel
 clip_processor: CLIPProcessor
-search_engine: MultimodalHNSWSearchEngine
+search_engine: MultimodalSearchEngine
 product_metadata: dict[str, dict[str, Any]] = {}
 
 
@@ -48,7 +47,7 @@ def _load_clip() -> tuple[CLIPModel, CLIPProcessor]:
     return model, processor
 
 
-def _build_index(engine: MultimodalHNSWSearchEngine) -> dict[str, dict[str, Any]]:
+def _build_index(engine: MultimodalSearchEngine) -> dict[str, dict[str, Any]]:
     """articles_feature.csv로 FAISS 인덱스 빌드. 데이터 없으면 빈 인덱스로 시작."""
     if not DATA_PATH.exists():
         LOGGER.warning("상품 데이터 없음: %s — 빈 인덱스로 시작", DATA_PATH)
@@ -108,7 +107,7 @@ def _build_index(engine: MultimodalHNSWSearchEngine) -> dict[str, dict[str, Any]
 async def lifespan(app: FastAPI):
     global clip_model, clip_processor, search_engine, product_metadata
     clip_model, clip_processor = _load_clip()
-    search_engine = MultimodalHNSWSearchEngine(dim=EMBEDDING_DIM)
+    search_engine = MultimodalSearchEngine("test")
     product_metadata = _build_index(search_engine)
     yield
 
@@ -206,6 +205,12 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "index_size": len(search_engine) if search_engine._is_built else 0,
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8002, reload=False)
+
 
 
 if __name__ == "__main__":
