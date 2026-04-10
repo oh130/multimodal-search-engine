@@ -11,8 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 TRANSACTIONS_FILE = BASE_DIR / "data" / "raw" / "transactions_train.csv"
 CUSTOMER_FEATURES_FILE = BASE_DIR / "data" / "processed" / "customer_features.csv"
-ARTICLE_FEATURES_FILE = BASE_DIR / "data" / "processed" / "article_features.csv"
-ARTICLE_FEATURES_FALLBACK_FILE = BASE_DIR / "data" / "processed" / "articles_feature.csv"
+ARTICLE_FEATURES_FILE = BASE_DIR / "data" / "processed" / "articles_feature.csv"
 
 # MODE = "production"
 MODE = "test"
@@ -123,19 +122,29 @@ def log_stage(stage: str, start_time: float, **stats: int) -> None:
     logging.info(message)
 
 
-def resolve_article_feature_path(preferred_path: Path) -> Path:
-    if preferred_path.exists():
-        return preferred_path
-    if ARTICLE_FEATURES_FALLBACK_FILE.exists():
-        logging.info(
-            "article_feature_file_missing preferred=%s fallback=%s",
-            preferred_path,
-            ARTICLE_FEATURES_FALLBACK_FILE,
+def resolve_required_file(file_path: Path, description: str) -> Path:
+    if file_path.exists():
+        return file_path
+    raise FileNotFoundError(f"Missing {description}: {file_path}")
+
+
+def validate_required_columns(
+    file_path: Path,
+    required_columns: Sequence[str],
+    key_column: str,
+) -> None:
+    with file_path.open(newline="", encoding="utf-8") as infile:
+        reader = csv.DictReader(infile)
+        fieldnames = reader.fieldnames or []
+
+    missing_columns = [column for column in required_columns if column not in fieldnames]
+    if key_column not in fieldnames:
+        missing_columns.insert(0, key_column)
+
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns in {file_path}: {', '.join(dict.fromkeys(missing_columns))}"
         )
-        return ARTICLE_FEATURES_FALLBACK_FILE
-    raise FileNotFoundError(
-        f"Missing article feature files: {preferred_path} and {ARTICLE_FEATURES_FALLBACK_FILE}"
-    )
 
 
 def load_customer_features(file_path: Path) -> Dict[str, CustomerFeature]:
@@ -532,12 +541,15 @@ def build_train_dataset(
 def main() -> None:
     configure_logging()
     run_start = time.perf_counter()
-    article_path = resolve_article_feature_path(ARTICLE_FEATURES_FILE)
+    customer_path = resolve_required_file(CUSTOMER_FEATURES_FILE, "customer feature file")
+    article_path = resolve_required_file(ARTICLE_FEATURES_FILE, "article feature file")
+    validate_required_columns(customer_path, CUSTOMER_FEATURE_COLUMNS, "customer_id")
+    validate_required_columns(article_path, ARTICLE_FEATURE_COLUMNS, "article_id")
     logging.info(
         "mode=%s transactions_file=%s customer_features_file=%s article_features_file=%s output_file=%s max_transaction_rows=%s negative_ratio=%s partition_count=%s random_seed=%s",
         MODE,
         TRANSACTIONS_FILE,
-        CUSTOMER_FEATURES_FILE,
+        customer_path,
         article_path,
         OUTPUT_FILE,
         MAX_TRANSACTION_ROWS,
@@ -547,7 +559,7 @@ def main() -> None:
     )
 
     customer_start = time.perf_counter()
-    customer_features = load_customer_features(CUSTOMER_FEATURES_FILE)
+    customer_features = load_customer_features(customer_path)
     log_stage("load_customer_features", customer_start, customer_count=len(customer_features))
 
     article_start = time.perf_counter()

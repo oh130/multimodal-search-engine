@@ -22,6 +22,7 @@ LOGGER = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parents[2]
 ARTICLE_FEATURES_PATH = BASE_DIR / "data" / "processed" / "articles_feature.csv"
 ITEM_FEATURES_PATH = BASE_DIR / "data" / "processed" / "item_features.csv"
+ITEM_FEATURES_TEST_PATH = BASE_DIR / "data" / "processed" / "item_features_test.csv"
 DEFAULT_CANDIDATE_POOL_SIZE = 100
 DEFAULT_NEW_ITEM_WINDOW_DAYS = 7
 DEFAULT_SIGNAL_LOOKUP_LIMIT_MULTIPLIER = 4
@@ -53,6 +54,13 @@ class ServingFeatureStore:
     color_to_ids: dict[str, tuple[str, ...]]
     popular_article_ids: tuple[str, ...]
     popularity_max: float
+
+
+def _resolve_item_features_path() -> Path | None:
+    for path in (ITEM_FEATURES_PATH, ITEM_FEATURES_TEST_PATH):
+        if path.exists():
+            return path
+    return None
 
 
 def normalize_article_id(article_id: Any) -> str:
@@ -107,22 +115,35 @@ def load_serving_artifacts() -> ServingFeatureStore:
     catalog = pd.read_csv(ARTICLE_FEATURES_PATH, dtype=str).fillna("UNKNOWN")
     catalog["article_id"] = catalog["article_id"].map(normalize_article_id)
 
-    if ITEM_FEATURES_PATH.exists():
-        popularity = pd.read_csv(ITEM_FEATURES_PATH, dtype={"article_id": str})
+    item_features_path = _resolve_item_features_path()
+    if item_features_path is not None:
+        popularity = pd.read_csv(item_features_path, dtype={"article_id": str}).fillna("")
         popularity["article_id"] = popularity["article_id"].map(normalize_article_id)
         popularity["popularity"] = pd.to_numeric(popularity.get("popularity"), errors="coerce").fillna(0.0)
+        popularity["item_age_days"] = pd.to_numeric(popularity.get("item_age_days"), errors="coerce")
+        popularity["is_new_item"] = popularity.get("is_new_item", "").astype(str).str.strip().str.lower().eq("true")
         catalog = catalog.merge(
-            popularity.loc[:, ["article_id", "popularity"]],
+            popularity.loc[:, ["article_id", "popularity", "item_age_days", "is_new_item"]],
             on="article_id",
             how="left",
         )
+        LOGGER.info("Loaded item feature file for serving: %s", item_features_path)
     else:
-        LOGGER.warning("Item popularity file not found: %s", ITEM_FEATURES_PATH)
+        LOGGER.warning(
+            "Item feature file not found. Checked %s and %s",
+            ITEM_FEATURES_PATH,
+            ITEM_FEATURES_TEST_PATH,
+        )
         catalog["popularity"] = 0.0
+        catalog["item_age_days"] = math.nan
+        catalog["is_new_item"] = False
 
     catalog["popularity"] = pd.to_numeric(catalog["popularity"], errors="coerce").fillna(0.0)
     catalog["item_age_days"] = pd.to_numeric(catalog.get("item_age_days"), errors="coerce")
-    catalog["is_new_item"] = catalog["item_age_days"].le(DEFAULT_NEW_ITEM_WINDOW_DAYS).fillna(False)
+    if "is_new_item" in catalog.columns:
+        catalog["is_new_item"] = catalog["is_new_item"].fillna(False).astype(bool)
+    else:
+        catalog["is_new_item"] = catalog["item_age_days"].le(DEFAULT_NEW_ITEM_WINDOW_DAYS).fillna(False)
     for column in ("category", "main_category", "color"):
         catalog[column] = catalog[column].map(_safe_text)
 
