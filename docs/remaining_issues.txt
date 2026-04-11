@@ -20,23 +20,33 @@
   모두 실제 동작 코드가 구현되어 있음. MAB, 다양성 제어, 신상품 노출도 포함.
   다만 딥러닝 모델이 스켈레톤이라 현재는 sklearn 기반 baseline으로 동작 중.
 
-3. Two-Tower 딥러닝 모델 미구현
-   - candidate/model.py, train.py, dataset.py 모두 docstring 스켈레톤만 있음
-   - 현재는 메타데이터 기반 유사도 매칭 + 인기도 폴백으로 대체 중
-   - Recall@300 ≥ 0.30 달성 여부 미측정
+3. Two-Tower 딥러닝 모델 부분 구현
+   - candidate/model.py, train.py, dataset.py, infer.py, evaluator.py 구현 완료
+   - 학습/추론/오프라인 평가는 가능하고 체크포인트(two_tower.pt)도 생성됨
+   - 다만 serving candidate_service에는 아직 미연결이라 현재 서빙은 메타데이터 + 인기도 baseline으로 동작
+   - Recall@300 측정됨: baseline 0.251665, Two-Tower 0.175214 (2026-04-12 실험 기준)
+   - 목표 Recall@300 ≥ 0.30은 아직 미달
 
 4. DeepFM Ranking 모델 미구현
    - ranking/model.py 스켈레톤만 있음
    - 현재는 sklearn LogisticRegression baseline으로 대체 중 (ranking_baseline.joblib)
-   - AUC ≥ 0.70 달성 여부 미측정
+   - ranking/train.py, infer.py, evaluator.py는 baseline 기준으로 구현 완료
+   - AUC 측정됨: 0.947862 (2026-04-11 baseline 리포트, max_users=30 기준)
+   - DeepFM/Wide&Deep 계열 실제 딥러닝 랭커는 아직 없음
 
 5. 세션 인코더 미구현
    - session/session_encoder.py 스켈레톤만 있음
    - 현재 세션 관심사는 Redis에서 단순 키워드 매칭으로 처리 중
    - GRU/Transformer 기반 단기 관심 임베딩 없음
 
-6. 추천 성능 지표 미측정
-   - HitRate@50, NDCG@50, Coverage 전부 미측정
+6. 추천 성능 지표 측정 완료
+   - rec_models/evaluation/evaluate_recommender.py에서 HitRate@K, NDCG@K, Coverage@K 계산 가능
+   - baseline 리포트 생성 완료:
+     HitRate@50 = 1.000000
+     NDCG@50 = 0.933807
+     Coverage@50 = 0.014961
+   - popularity baseline 비교도 구현되어 있음
+   - 다만 현재 리포트는 max_users=30 샘플 기준이라 전체 데이터 기준 재측정 필요
 
 ────────────────────────────
 [시뮬레이터]
