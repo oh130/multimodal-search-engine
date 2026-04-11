@@ -219,3 +219,4 @@ rec_models/data/processed/
 # ========================
 AGENTS.md
 /.claude
+/data/faiss_index
