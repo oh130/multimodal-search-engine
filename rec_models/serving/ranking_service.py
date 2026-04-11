@@ -168,6 +168,77 @@ def build_ranking_features(
     return prepare_inference_features(features, feature_columns=feature_columns)
 
 
+def build_batch_ranking_features(candidate_items: pd.DataFrame) -> pd.DataFrame:
+    """Build ranking features for many user-item rows in one pass.
+
+    This path is intended for offline evaluation where candidate rows already
+    contain a `customer_id` column. It avoids repeated per-user feature frame
+    construction and lets sklearn preprocess/score the whole batch at once.
+    """
+
+    if candidate_items.empty:
+        return pd.DataFrame()
+    if "customer_id" not in candidate_items.columns:
+        raise ValueError("Batch ranking features require a customer_id column.")
+
+    feature_columns = list(get_ranking_feature_columns())
+    customer_features = load_customer_features()
+
+    safe_candidates = candidate_items.copy()
+    safe_candidates["customer_id"] = safe_candidates["customer_id"].astype(str)
+
+    if customer_features.empty:
+        user_features = pd.DataFrame(index=safe_candidates.index)
+        user_features["age"] = DEFAULT_NUMERIC_VALUE
+        user_features["age_bucket"] = DEFAULT_CATEGORICAL_VALUE
+        user_features["fashion_news_frequency"] = DEFAULT_CATEGORICAL_VALUE
+        user_features["club_member_status"] = DEFAULT_CATEGORICAL_VALUE
+    else:
+        join_columns = ["customer_id", "age", "age_bucket", "fashion_news_frequency", "club_member_status"]
+        user_features = safe_candidates.loc[:, ["customer_id"]].merge(
+            customer_features.reset_index(drop=True).loc[:, join_columns],
+            on="customer_id",
+            how="left",
+        )
+        user_features["age"] = pd.to_numeric(user_features.get("age"), errors="coerce")
+        user_features["age_bucket"] = user_features["age_bucket"].map(_safe_get_text)
+        user_features["fashion_news_frequency"] = user_features["fashion_news_frequency"].map(_safe_get_text)
+        user_features["club_member_status"] = user_features["club_member_status"].map(_safe_get_text)
+
+    safe_text_frame = safe_candidates.reindex(
+        columns=[
+            "prod_name",
+            "product_type_name",
+            "product_group_name",
+            "colour_group_name",
+            "perceived_colour_master_name",
+            "department_name",
+            "section_name",
+            "garment_group_name",
+            "category",
+            "main_category",
+            "color",
+        ],
+        fill_value=DEFAULT_CATEGORICAL_VALUE,
+    ).copy()
+    for column in safe_text_frame.columns:
+        safe_text_frame[column] = safe_text_frame[column].map(_safe_get_text)
+
+    features = pd.DataFrame(index=safe_candidates.index)
+    features["age"] = user_features["age"]
+    features["age_bucket"] = user_features["age_bucket"]
+    features["fashion_news_frequency"] = user_features["fashion_news_frequency"]
+    features["club_member_status"] = user_features["club_member_status"]
+    for column in safe_text_frame.columns:
+        features[column] = safe_text_frame[column]
+
+    features["age_category"] = features["age_bucket"] + "_" + features["category"]
+    features["age_color"] = features["age_bucket"] + "_" + features["color"]
+    features["member_category"] = features["club_member_status"] + "_" + features["category"]
+    features["fashion_category"] = features["fashion_news_frequency"] + "_" + features["category"]
+    return prepare_inference_features(features, feature_columns=feature_columns)
+
+
 def score_candidates(
     user_id: str,
     candidate_items: pd.DataFrame,
@@ -185,6 +256,33 @@ def score_candidates(
         candidate_items=candidate_items,
         session_context=session_context,
     )
+    scores = _extract_scores(model=model, features=ranking_features)
+
+    result = candidate_items.copy()
+    result["score"] = scores
+    cold_start_mask = result.get("candidate_reason", pd.Series(index=result.index, dtype=object)).eq("cold_start_popularity")
+    session_interest_mask = result.get("matches_session_interest", pd.Series(False, index=result.index)).fillna(False).astype(bool)
+    recent_click_mask = result.get("matches_recent_click_signal", pd.Series(False, index=result.index)).fillna(False).astype(bool)
+    result["reason"] = np.select(
+        [cold_start_mask, session_interest_mask, recent_click_mask],
+        ["cold_start_popularity", "session_interest_match", "recent_click_similarity"],
+        default="ranking_score",
+    )
+    result["is_exploration"] = False
+    return result
+
+
+def score_candidate_batch(
+    candidate_items: pd.DataFrame,
+    checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
+) -> pd.DataFrame:
+    """Score many candidate rows across users in one model pass."""
+
+    if candidate_items.empty:
+        return candidate_items.copy()
+
+    model, _ = load_ranking_pipeline(checkpoint_dir=checkpoint_dir)
+    ranking_features = build_batch_ranking_features(candidate_items=candidate_items)
     scores = _extract_scores(model=model, features=ranking_features)
 
     result = candidate_items.copy()

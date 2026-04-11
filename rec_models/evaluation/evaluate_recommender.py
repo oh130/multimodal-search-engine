@@ -11,14 +11,26 @@ import pandas as pd
 
 try:
     from rec_models.evaluation.metrics import coverage_at_k, hit_rate_at_k, mean_metric, ndcg_at_k
-    from rec_models.serving.candidate_service import load_article_catalog, normalize_article_id
+    from rec_models.evaluation.data_utils import (
+        EvaluationContext,
+        build_session_context,
+        build_evaluation_context,
+        load_evaluation_data,
+    )
+    from rec_models.serving.candidate_service import load_article_catalog
     from rec_models.serving.recommend_service import rank_candidates_to_recommendations
-    from rec_models.serving.ranking_service import load_customer_features
+    from rec_models.serving.ranking_service import load_customer_features, score_candidate_batch
 except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
     from evaluation.metrics import coverage_at_k, hit_rate_at_k, mean_metric, ndcg_at_k  # type: ignore[no-redef]
-    from serving.candidate_service import load_article_catalog, normalize_article_id  # type: ignore[no-redef]
+    from evaluation.data_utils import (  # type: ignore[no-redef]
+        EvaluationContext,
+        build_session_context,
+        build_evaluation_context,
+        load_evaluation_data,
+    )
+    from serving.candidate_service import load_article_catalog  # type: ignore[no-redef]
     from serving.recommend_service import rank_candidates_to_recommendations  # type: ignore[no-redef]
-    from serving.ranking_service import load_customer_features  # type: ignore[no-redef]
+    from serving.ranking_service import load_customer_features, score_candidate_batch  # type: ignore[no-redef]
 
 
 DEFAULT_TOP_K = 50
@@ -36,46 +48,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip the popularity baseline comparison.",
     )
     return parser.parse_args()
-
-
-def load_evaluation_data(data_path: Path) -> pd.DataFrame:
-    """Load and normalize evaluation data."""
-
-    resolved_path = data_path.expanduser().resolve()
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"Evaluation data not found: {resolved_path}")
-
-    data = pd.read_csv(resolved_path)
-    required_columns = {"customer_id", "article_id"}
-    missing_columns = required_columns - set(data.columns)
-    if missing_columns:
-        raise ValueError(f"Evaluation data is missing required columns: {sorted(missing_columns)}")
-
-    data["customer_id"] = data["customer_id"].astype(str)
-    data["article_id"] = data["article_id"].map(normalize_article_id)
-    return data
-
-
-def infer_positive_mask(data: pd.DataFrame) -> pd.Series:
-    """Infer positive interactions from common processed-data conventions."""
-
-    if "label" in data.columns:
-        return pd.to_numeric(data["label"], errors="coerce").fillna(0).eq(1)
-
-    for column in ("is_positive", "target", "clicked", "purchased"):
-        if column in data.columns:
-            return data[column].astype(str).str.lower().isin({"1", "true", "yes"})
-
-    if "ground_truth_article_id" in data.columns:
-        return data["article_id"].astype(str).eq(data["ground_truth_article_id"].map(normalize_article_id))
-
-    if "sales_channel_id" in data.columns:
-        return pd.to_numeric(data["sales_channel_id"], errors="coerce").fillna(-1).ne(-1)
-
-    raise ValueError(
-        "Could not infer positive rows. Expected one of: label, is_positive, target, "
-        "clicked, purchased, ground_truth_article_id, or sales_channel_id."
-    )
 
 
 def enrich_candidate_rows(data: pd.DataFrame) -> pd.DataFrame:
@@ -108,14 +80,6 @@ def enrich_candidate_rows(data: pd.DataFrame) -> pd.DataFrame:
     return enriched
 
 
-def build_ground_truth_by_user(data: pd.DataFrame, positive_mask: pd.Series) -> dict[str, list[str]]:
-    """Build user -> positive article ids."""
-
-    positives = data.loc[positive_mask, ["customer_id", "article_id"]].drop_duplicates()
-    grouped = positives.groupby("customer_id", sort=False)["article_id"].apply(list)
-    return grouped.to_dict()
-
-
 def build_cold_start_user_set(user_ids: list[str]) -> set[str]:
     """Identify users missing from serving-time customer features."""
 
@@ -125,28 +89,6 @@ def build_cold_start_user_set(user_ids: list[str]) -> set[str]:
 
     known_users = set(customer_features["customer_id"].astype(str))
     return {user_id for user_id in user_ids if user_id not in known_users}
-
-
-def build_session_context(user_rows: pd.DataFrame) -> dict[str, Any]:
-    """Extract serving-compatible session context from optional evaluation columns."""
-
-    recent_clicks: list[str] = []
-    session_interest: Any = None
-
-    if "recent_clicks" in user_rows.columns:
-        raw_value = user_rows["recent_clicks"].dropna().astype(str).head(1)
-        if not raw_value.empty:
-            recent_clicks = [normalize_article_id(item_id) for item_id in raw_value.iloc[0].split(",") if item_id.strip()]
-
-    if "session_interest" in user_rows.columns:
-        raw_interest = user_rows["session_interest"].dropna().head(1)
-        if not raw_interest.empty:
-            session_interest = raw_interest.iloc[0]
-
-    return {
-        "recent_clicks": recent_clicks,
-        "session_interest": session_interest,
-    }
 
 
 def popularity_recommendations(user_rows: pd.DataFrame, top_k: int) -> list[str]:
@@ -182,37 +124,41 @@ def evaluate_recommender(
     data: pd.DataFrame,
     top_k: int,
     max_users: int | None = None,
+    context: EvaluationContext | None = None,
 ) -> dict[str, Any]:
     """Evaluate the current serving ranking+rerranking pipeline."""
 
-    positive_mask = infer_positive_mask(data)
-    ground_truth_by_user = build_ground_truth_by_user(data, positive_mask)
-    user_ids = list(ground_truth_by_user.keys())
-    if max_users is not None:
-        user_ids = user_ids[:max_users]
-
-    cold_start_users = build_cold_start_user_set(user_ids)
-    total_candidate_count = int(data["article_id"].nunique())
+    evaluation_context = context or build_evaluation_context(data, max_users=max_users)
+    cold_start_users = build_cold_start_user_set(evaluation_context.sampled_user_ids)
+    user_set = set(evaluation_context.sampled_user_ids)
+    scored_batch = score_candidate_batch(
+        data.loc[data["customer_id"].astype(str).isin(user_set)].copy()
+    )
+    scored_rows_by_id = {
+        str(user_id): user_rows.copy()
+        for user_id, user_rows in scored_batch.groupby("customer_id", sort=False)
+    }
 
     ranked_lists: list[list[str]] = []
     relevant_lists: list[list[str]] = []
     cold_ranked_lists: list[list[str]] = []
     cold_relevant_lists: list[list[str]] = []
 
-    for user_id in user_ids:
-        user_rows = data.loc[data["customer_id"].eq(user_id)].copy()
-        if user_rows.empty:
+    for user_id in evaluation_context.sampled_user_ids:
+        user_rows = evaluation_context.user_rows_by_id.get(user_id)
+        scored_user_rows = scored_rows_by_id.get(user_id)
+        if user_rows is None or user_rows.empty or scored_user_rows is None or scored_user_rows.empty:
             continue
 
         session_context = build_session_context(user_rows)
         recommendations = rank_candidates_to_recommendations(
             user_id=user_id,
-            candidate_items=user_rows,
+            candidate_items=scored_user_rows,
             top_n=top_k,
             session_context=session_context,
         )
         ranked_items = [str(item["product_id"]) for item in recommendations]
-        relevant_items = ground_truth_by_user[user_id]
+        relevant_items = evaluation_context.ground_truth_by_user[user_id]
 
         ranked_lists.append(ranked_items)
         relevant_lists.append(relevant_items)
@@ -223,14 +169,14 @@ def evaluate_recommender(
     result = compute_metric_summary(
         ranked_lists=ranked_lists,
         relevant_lists=relevant_lists,
-        total_candidate_count=total_candidate_count,
+        total_candidate_count=evaluation_context.total_candidate_count,
         k=top_k,
         evaluated_users=len(ranked_lists),
     )
     result["cold_start_subset"] = compute_metric_summary(
         ranked_lists=cold_ranked_lists,
         relevant_lists=cold_relevant_lists,
-        total_candidate_count=total_candidate_count,
+        total_candidate_count=evaluation_context.total_candidate_count,
         k=top_k,
         evaluated_users=len(cold_ranked_lists),
     )
@@ -241,30 +187,25 @@ def evaluate_popularity_baseline(
     data: pd.DataFrame,
     top_k: int,
     max_users: int | None = None,
+    context: EvaluationContext | None = None,
 ) -> dict[str, Any]:
     """Evaluate a popularity-only baseline on the same user candidate sets."""
 
-    positive_mask = infer_positive_mask(data)
-    ground_truth_by_user = build_ground_truth_by_user(data, positive_mask)
-    user_ids = list(ground_truth_by_user.keys())
-    if max_users is not None:
-        user_ids = user_ids[:max_users]
-
-    cold_start_users = build_cold_start_user_set(user_ids)
-    total_candidate_count = int(data["article_id"].nunique())
+    evaluation_context = context or build_evaluation_context(data, max_users=max_users)
+    cold_start_users = build_cold_start_user_set(evaluation_context.sampled_user_ids)
 
     ranked_lists: list[list[str]] = []
     relevant_lists: list[list[str]] = []
     cold_ranked_lists: list[list[str]] = []
     cold_relevant_lists: list[list[str]] = []
 
-    for user_id in user_ids:
-        user_rows = data.loc[data["customer_id"].eq(user_id)].copy()
-        if user_rows.empty:
+    for user_id in evaluation_context.sampled_user_ids:
+        user_rows = evaluation_context.user_rows_by_id.get(user_id)
+        if user_rows is None or user_rows.empty:
             continue
 
         ranked_items = popularity_recommendations(user_rows=user_rows, top_k=top_k)
-        relevant_items = ground_truth_by_user[user_id]
+        relevant_items = evaluation_context.ground_truth_by_user[user_id]
 
         ranked_lists.append(ranked_items)
         relevant_lists.append(relevant_items)
@@ -275,14 +216,14 @@ def evaluate_popularity_baseline(
     result = compute_metric_summary(
         ranked_lists=ranked_lists,
         relevant_lists=relevant_lists,
-        total_candidate_count=total_candidate_count,
+        total_candidate_count=evaluation_context.total_candidate_count,
         k=top_k,
         evaluated_users=len(ranked_lists),
     )
     result["cold_start_subset"] = compute_metric_summary(
         ranked_lists=cold_ranked_lists,
         relevant_lists=cold_relevant_lists,
-        total_candidate_count=total_candidate_count,
+        total_candidate_count=evaluation_context.total_candidate_count,
         k=top_k,
         evaluated_users=len(cold_ranked_lists),
     )

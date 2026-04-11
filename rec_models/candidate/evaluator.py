@@ -1,12 +1,197 @@
-"""
-Two-Tower retrieval 평가 코드 위치.
+"""Offline evaluator for the current candidate generation stage."""
 
-역할:
-- Recall@K 등 retrieval 성능을 측정한다.
-- candidate 품질을 ranking 이전 단계에서 독립적으로 검증한다.
+from __future__ import annotations
 
-작성 지침:
-- 평가 데이터셋과 학습 데이터셋의 역할을 섞지 않는다.
-- top-k 기준, 정답 정의, 배치 평가 방식이 명확해야 한다.
-- 공통 지표 구현은 가능하면 common.metrics를 재사용하는 방향으로 맞춘다.
-"""
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+try:
+    from rec_models.common.metrics import mean_metric, recall_at_k
+    from rec_models.evaluation.data_utils import (
+        EvaluationContext,
+        build_session_context,
+        build_evaluation_context,
+        load_evaluation_data,
+    )
+    from rec_models.candidate.infer import DEFAULT_CHECKPOINT_DIR, retrieve_candidates_for_users
+    from rec_models.serving.candidate_service import generate_candidates
+except ImportError:  # pragma: no cover - supports running from rec_models/ as cwd
+    from common.metrics import mean_metric, recall_at_k  # type: ignore[no-redef]
+    from evaluation.data_utils import (  # type: ignore[no-redef]
+        EvaluationContext,
+        build_session_context,
+        build_evaluation_context,
+        load_evaluation_data,
+    )
+    from candidate.infer import DEFAULT_CHECKPOINT_DIR, retrieve_candidates_for_users  # type: ignore[no-redef]
+    from serving.candidate_service import generate_candidates  # type: ignore[no-redef]
+
+
+DEFAULT_TOP_K = 300
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate candidate retrieval quality offline.")
+    parser.add_argument("--data", type=Path, required=True, help="Path to processed recommendation data.")
+    parser.add_argument("--top_k", type=int, default=DEFAULT_TOP_K, help="Retrieval cutoff K.")
+    parser.add_argument("--candidate-pool-size", type=int, help="Optional explicit candidate pool size.")
+    parser.add_argument("--max-users", type=int, help="Optional cap for smoke checks or faster iteration.")
+    parser.add_argument(
+        "--mode",
+        choices=("baseline", "two-tower", "compare"),
+        default="baseline",
+        help="Evaluate heuristic baseline, trained Two-Tower, or both.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=DEFAULT_CHECKPOINT_DIR,
+        help="Checkpoint directory containing two_tower.pt when mode uses Two-Tower.",
+    )
+    parser.add_argument("--output-json", type=Path, help="Optional output path for JSON metrics.")
+    return parser.parse_args()
+
+
+def evaluate_candidate_retrieval(
+    data: pd.DataFrame,
+    top_k: int,
+    candidate_pool_size: int | None = None,
+    max_users: int | None = None,
+    context: EvaluationContext | None = None,
+) -> dict[str, Any]:
+    """Measure retrieval recall for the current candidate generation stage."""
+
+    evaluation_context = context or build_evaluation_context(data, max_users=max_users)
+
+    ranked_lists: list[list[str]] = []
+    relevant_lists: list[list[str]] = []
+
+    for user_id in evaluation_context.sampled_user_ids:
+        user_rows = evaluation_context.user_rows_by_id.get(user_id)
+        if user_rows is None or user_rows.empty:
+            continue
+
+        session_context = build_session_context(user_rows)
+        candidates = generate_candidates(
+            user_id=user_id,
+            top_k=top_k,
+            recent_clicks=session_context["recent_clicks"],
+            session_interest=session_context["session_interest"],
+            candidate_pool_size=candidate_pool_size,
+        )
+        ranked_lists.append(candidates["article_id"].astype(str).head(top_k).tolist())
+        relevant_lists.append(evaluation_context.ground_truth_by_user[user_id])
+
+    return {
+        "users_evaluated": len(ranked_lists),
+        f"Recall@{top_k}": mean_metric(ranked_lists, relevant_lists, recall_at_k, top_k),
+    }
+
+
+def evaluate_two_tower_retrieval(
+    data: pd.DataFrame,
+    top_k: int,
+    checkpoint_dir: Path = DEFAULT_CHECKPOINT_DIR,
+    max_users: int | None = None,
+    context: EvaluationContext | None = None,
+) -> dict[str, Any]:
+    """Measure Recall@K using a trained Two-Tower retrieval model."""
+
+    evaluation_context = context or build_evaluation_context(data, max_users=max_users)
+    user_frame = data.loc[data["customer_id"].astype(str).isin(set(evaluation_context.sampled_user_ids))].copy()
+    retrievals = retrieve_candidates_for_users(
+        user_rows=user_frame,
+        items=data,
+        checkpoint_dir=checkpoint_dir,
+        top_k=top_k,
+        exclude_seen_items=False,
+    )
+
+    ranked_lists: list[list[str]] = []
+    relevant_lists: list[list[str]] = []
+    for user_id in evaluation_context.sampled_user_ids:
+        predictions = retrievals.get(user_id, [])
+        if not predictions:
+            continue
+        ranked_lists.append([str(item["article_id"]) for item in predictions])
+        relevant_lists.append(evaluation_context.ground_truth_by_user[user_id])
+
+    return {
+        "users_evaluated": len(ranked_lists),
+        f"Recall@{top_k}": mean_metric(ranked_lists, relevant_lists, recall_at_k, top_k),
+    }
+
+
+def print_report(metrics: dict[str, Any], top_k: int, title: str = "Candidate Retrieval") -> None:
+    """Pretty-print candidate retrieval metrics."""
+
+    print(title)
+    print(f"{'users evaluated':<18} {metrics['users_evaluated']}")
+    print(f"{f'Recall@{top_k}':<18} {metrics[f'Recall@{top_k}']:.6f}")
+
+
+def main() -> None:
+    args = parse_args()
+    data = load_evaluation_data(args.data)
+    context = build_evaluation_context(data, max_users=args.max_users)
+
+    if args.mode == "baseline":
+        metrics = evaluate_candidate_retrieval(
+            data=data,
+            top_k=args.top_k,
+            candidate_pool_size=args.candidate_pool_size,
+            max_users=args.max_users,
+            context=context,
+        )
+        print_report(metrics, top_k=args.top_k, title="Candidate Retrieval Baseline")
+    elif args.mode == "two-tower":
+        metrics = evaluate_two_tower_retrieval(
+            data=data,
+            top_k=args.top_k,
+            checkpoint_dir=args.checkpoint_dir,
+            max_users=args.max_users,
+            context=context,
+        )
+        print_report(metrics, top_k=args.top_k, title="Candidate Retrieval Two-Tower")
+    else:
+        baseline_metrics = evaluate_candidate_retrieval(
+            data=data,
+            top_k=args.top_k,
+            candidate_pool_size=args.candidate_pool_size,
+            max_users=args.max_users,
+            context=context,
+        )
+        two_tower_metrics = evaluate_two_tower_retrieval(
+            data=data,
+            top_k=args.top_k,
+            checkpoint_dir=args.checkpoint_dir,
+            max_users=args.max_users,
+            context=context,
+        )
+        metrics = {
+            "baseline": baseline_metrics,
+            "two_tower": two_tower_metrics,
+            "lift": {
+                f"Recall@{args.top_k}": two_tower_metrics[f"Recall@{args.top_k}"] - baseline_metrics[f"Recall@{args.top_k}"],
+            },
+        }
+        print_report(baseline_metrics, top_k=args.top_k, title="Candidate Retrieval Baseline")
+        print()
+        print_report(two_tower_metrics, top_k=args.top_k, title="Candidate Retrieval Two-Tower")
+        print()
+        print("Two-Tower Lift")
+        print(f"{f'Recall@{args.top_k}':<18} {metrics['lift'][f'Recall@{args.top_k}']:.6f}")
+
+    if args.output_json is not None:
+        output_path = args.output_json.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        print(f"\nSaved JSON metrics to {output_path}")
+
+
+if __name__ == "__main__":
+    main()

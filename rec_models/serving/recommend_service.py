@@ -59,6 +59,12 @@ def rank_candidates_to_recommendations(
     """Convert candidate rows into final recommendations using serving ranking logic."""
 
     session_context = session_context or {"recent_clicks": [], "session_interest": None}
+    if "score" in candidate_items.columns:
+        return rerank_recommendations(
+            scored_candidates=candidate_items,
+            top_n=top_n,
+            random_seed=_random_seed_from_context(user_id=user_id, session_context=session_context),
+        )
 
     try:
         scored_candidates = score_candidates(
