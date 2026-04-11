@@ -212,7 +212,11 @@ __marimo__/
 data/raw_data/
 data/raw
 data/processed/
+data/checkpoints/
 rec_models/data/processed/
+rec_models/checkpoints/*.pt
+rec_models/checkpoints/*.joblib
+rec_models/checkpoints/*_metadata.json
 
 # ========================
 # Local config
