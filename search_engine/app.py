@@ -11,12 +11,12 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import torch
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -28,40 +28,27 @@ from search_engine import MultimodalSearchEngine
 
 LOGGER = logging.getLogger(__name__)
 
-CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 EMBEDDING_DIM = 512
+TEST_SAMPLE_SIZE = 5000
 DATA_PATH = Path("/app/data/processed/articles_feature.csv")
 
-# 전역 객체
+# test/production 인덱스 캐시 경로 분리
+TEST_INDEX_PATH = Path("/app/data/faiss_index/search_test.index")
+TEST_META_PATH  = Path("/app/data/faiss_index/search_test_metadata.json")
+PROD_INDEX_PATH = Path("/app/data/faiss_index/search.index")
+PROD_META_PATH  = Path("/app/data/faiss_index/search_metadata.json")
+
+# 전역 객체 (search_engine.embedder에서 노출 — 별도 로딩 없음)
 clip_model: CLIPModel
 clip_processor: CLIPProcessor
 search_engine: MultimodalSearchEngine
 product_metadata: dict[str, dict[str, Any]] = {}
 
 
-def _load_clip() -> tuple[CLIPModel, CLIPProcessor]:
-    LOGGER.info("CLIP 모델 로딩 중: %s", CLIP_MODEL_NAME)
-    model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
-    processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
-    model.eval()
-    LOGGER.info("CLIP 모델 로딩 완료")
-    return model, processor
-
-
-def _build_index(engine: MultimodalSearchEngine) -> dict[str, dict[str, Any]]:
-    """articles_feature.csv로 FAISS 인덱스 빌드. 데이터 없으면 빈 인덱스로 시작."""
-    if not DATA_PATH.exists():
-        LOGGER.warning("상품 데이터 없음: %s — 빈 인덱스로 시작", DATA_PATH)
-        return {}
-
-    df = pd.read_csv(DATA_PATH, dtype=str).fillna("")
-    if df.empty:
-        LOGGER.warning("상품 데이터가 비어있음 — 빈 인덱스로 시작")
-        return {}
-
-    LOGGER.info("상품 %d건 임베딩 시작", len(df))
-    embeddings = []
-    metadata = {}
+def _embed_df(engine: MultimodalSearchEngine, df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """engine.embedder로 DataFrame을 임베딩하고 FAISS 인덱스를 빌드한다."""
+    embeddings: list[np.ndarray] = []
+    metadatas: list[dict[str, Any]] = []
 
     for _, row in df.iterrows():
         article_id = str(row.get("article_id", "")).strip()
@@ -73,16 +60,15 @@ def _build_index(engine: MultimodalSearchEngine) -> dict[str, dict[str, Any]]:
             row.get("product_type_name", ""),
             row.get("colour_group_name", ""),
             row.get("department_name", ""),
-        ]))
+        ])) or article_id
 
-        inputs = clip_processor(text=[text], return_tensors="pt", padding=True, truncation=True)
-        with torch.no_grad():
-            outputs = clip_model.get_text_features(**inputs)
-            emb = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
-            emb = torch.nn.functional.normalize(emb, dim=-1)
+        vec = engine.embedder.embed_text(text)  # CLIP 추론 (전역 모델 재사용)
+        if vec.shape[0] != engine.dimension:
+            LOGGER.warning("임베딩 shape 불일치 (article_id=%s) — 건너뜀", article_id)
+            continue
 
-        embeddings.append(emb.squeeze().numpy())
-        metadata[len(embeddings) - 1] = {
+        embeddings.append(vec)
+        metadatas.append({
             "article_id": article_id,
             "product_id": article_id,
             "name": row.get("prod_name", ""),
@@ -90,26 +76,60 @@ def _build_index(engine: MultimodalSearchEngine) -> dict[str, dict[str, Any]]:
             "category": row.get("category", ""),
             "main_category": row.get("main_category", ""),
             "color": row.get("colour_group_name", ""),
-        }
+        })
 
     if not embeddings:
         return {}
 
     engine.build_index(
-        embeddings=np.array(embeddings, dtype=np.float32),
+        embeddings=np.stack(embeddings).astype(np.float32),
         item_ids=list(range(len(embeddings))),
-        metadatas=list(metadata.values()),
+        metadatas=metadatas,
     )
     LOGGER.info("FAISS 인덱스 빌드 완료: %d건", len(embeddings))
-    return {str(v["product_id"]): v for v in metadata.values()}
+    return {str(m["product_id"]): m for m in metadatas}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global clip_model, clip_processor, search_engine, product_metadata
-    clip_model, clip_processor = _load_clip()
-    search_engine = MultimodalSearchEngine("test")
-    product_metadata = _build_index(search_engine)
+
+    mode = os.getenv("SEARCH_ENGINE_MODE", "test")
+    index_path = TEST_INDEX_PATH if mode == "test" else PROD_INDEX_PATH
+    meta_path  = TEST_META_PATH  if mode == "test" else PROD_META_PATH
+    sample_size = TEST_SAMPLE_SIZE if mode == "test" else None
+
+    if index_path.exists() and meta_path.exists():
+        # 캐시 히트: 저장된 인덱스 로드 (수초, CLIP 1회 로딩)
+        LOGGER.info("%s 모드 — 저장된 FAISS 인덱스 로드: %s", mode, index_path)
+        search_engine = MultimodalSearchEngine.load_from_artifacts(str(index_path), str(meta_path))
+        product_metadata = {
+            item.product_id: {"product_id": item.product_id, "name": item.name, "price": item.price}
+            for item in search_engine.items
+        }
+        LOGGER.info("FAISS 인덱스 로드 완료: %d건", len(search_engine.items))
+
+    else:
+        # 캐시 미스: 임베딩 후 저장 (CLIP 1회 로딩)
+        search_engine = MultimodalSearchEngine("test")  # CLIP 로드 (더미 인덱스로 초기화)
+
+        if DATA_PATH.exists():
+            df = pd.read_csv(DATA_PATH, dtype=str).fillna("")
+            if sample_size:
+                df = df.sample(n=min(sample_size, len(df)), random_state=42)
+            LOGGER.info("%s 모드 — %d건 임베딩 시작 (최초 1회, 이후 캐시 사용)", mode, len(df))
+            product_metadata = _embed_df(search_engine, df)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            search_engine.save_index(str(index_path), str(meta_path))
+            LOGGER.info("FAISS 인덱스 저장 완료: %s", index_path)
+        else:
+            LOGGER.warning("articles_feature.csv 없음 — 더미 12개로 실행")
+            product_metadata = {}
+
+    # CLIP을 별도로 로딩하지 않고 search_engine.embedder에서 노출 (중복 로딩 제거)
+    clip_model = search_engine.embedder.model
+    clip_processor = search_engine.embedder.processor
+
     yield
 
 
@@ -139,21 +159,13 @@ async def search(req: SearchRequest) -> dict[str, Any]:
     image_emb = None
 
     if has_text:
-        inputs = clip_processor(text=[req.query], return_tensors="pt", padding=True, truncation=True)
-        with torch.no_grad():
-            outputs = clip_model.get_text_features(**inputs)
-            emb = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
-            text_emb = torch.nn.functional.normalize(emb, dim=-1).squeeze().numpy()
+        text_emb = search_engine.embedder.embed_text(req.query)
 
     if has_image:
         try:
             image_bytes = base64.b64decode(req.image_base64)
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            inputs = clip_processor(images=image, return_tensors="pt")
-            with torch.no_grad():
-                outputs = clip_model.get_image_features(**inputs)
-                emb = outputs if isinstance(outputs, torch.Tensor) else outputs[0]
-                image_emb = torch.nn.functional.normalize(emb, dim=-1).squeeze().numpy()
+            image_emb = search_engine.embedder.embed_image(image)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"이미지 디코딩 실패: {e}")
 

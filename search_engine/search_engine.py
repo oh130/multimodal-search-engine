@@ -109,7 +109,7 @@ class OpenAIClipEmbedder:
             for kwargs in load_attempts:
                 try:
                     self.processor = CLIPProcessor.from_pretrained(self.model_name, **kwargs)
-                    self.model = CLIPModel.from_pretrained(self.model_name, use_safetensors=False, **kwargs)
+                    self.model = CLIPModel.from_pretrained(self.model_name, **kwargs)
                     break
                 except Exception as exc:
                     last_error = exc
@@ -745,6 +745,8 @@ class MultimodalSearchEngine:
             for item in meta.get("items", [])
         ]
         obj._embeddings = None
+        obj._is_built = True
+        obj.item_ids = [str(item.product_id) for item in obj.items]
         return obj
 
 def _configure_logging() -> None:

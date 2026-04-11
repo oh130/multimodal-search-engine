@@ -23,6 +23,7 @@ services:
       - SEARCH_ENGINE_MODE=test
     volumes:
       - ./data:/app/data
+      - huggingface_cache:/root/.cache/huggingface
 
   # C 파트 (모델)
   rec-models:
@@ -31,9 +32,13 @@ services:
       - "8003:8003"
     volumes:
       - ./data:/app/data
+      - huggingface_cache:/root/.cache/huggingface
 
   # 공용 DB
   redis:
     image: redis:latest
     ports:
       - "6379:6379"
+
+volumes:
+  huggingface_cache:
