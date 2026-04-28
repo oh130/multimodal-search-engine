@@ -224,3 +224,5 @@ rec_models/checkpoints/*_metadata.json
 AGENTS.md
 /.claude
 /data/faiss_index
+중간보고서_사나이들.docx
+generate_report.py
