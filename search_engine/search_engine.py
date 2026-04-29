@@ -29,6 +29,7 @@ DEFAULT_PORT = 8002
 
 
 class _NumpyInnerProductIndex:
+    # FAISS를 쓸 수 없는 환경에서만 사용하는 최소 기능 대체 인덱스다.
     def __init__(self, dimension: int) -> None:
         self.dimension = int(dimension)
         self.vectors = np.empty((0, self.dimension), dtype=np.float32)
@@ -81,6 +82,7 @@ def encode_image_file(path: Path | str) -> Optional[Image.Image]:
 
 
 class OpenAIClipEmbedder:
+    # 텍스트/이미지를 OpenAI CLIP 공통 임베딩 공간으로 변환한다.
     def __init__(
         self,
         model_name: str = CLIP_MODEL_NAME,
@@ -101,6 +103,7 @@ class OpenAIClipEmbedder:
             return
         try:
             LOGGER.info("Loading CLIP model: %s", self.model_name)
+            # 오프라인 캐시를 먼저 확인하고, 없을 때만 원격 다운로드를 시도한다.
             load_attempts = (
                 {"local_files_only": True},
                 {"local_files_only": False},
@@ -161,6 +164,7 @@ class OpenAIClipEmbedder:
         value = (text or "").strip()
         if not value:
             return np.zeros(dim, dtype=np.float32)
+        # text tower의 pooled output을 projection layer로 512차원 CLIP 공간에 투영한다.
         inputs = processor(text=[value], return_tensors="pt", padding=True, truncation=True)
         inputs = {key: tensor.to(self.device) for key, tensor in inputs.items()}
         with torch.no_grad():
@@ -176,6 +180,7 @@ class OpenAIClipEmbedder:
     def embed_image(self, image: Image.Image) -> np.ndarray:
         model, processor, _ = self._require_components()
         rgb_image = image.convert("RGB")
+        # vision tower의 pooled output을 projection layer로 512차원 CLIP 공간에 투영한다.
         inputs = processor(images=rgb_image, return_tensors="pt")
         inputs = {key: tensor.to(self.device) for key, tensor in inputs.items()}
         with torch.no_grad():
@@ -186,6 +191,7 @@ class OpenAIClipEmbedder:
         return self._normalize(features[0].detach().cpu().numpy())
 
     def combine_embeddings(self, vectors: Sequence[np.ndarray]) -> np.ndarray:
+        # hybrid 검색은 텍스트/이미지 벡터를 평균낸 뒤 다시 정규화한다.
         _, _, dim = self._require_components()
         usable = [self._normalize(vec) for vec in vectors if vec is not None and np.any(vec)]
         if not usable:
@@ -211,6 +217,7 @@ class OpenAIClipEmbedder:
         return self.embed_text(text or ""), "text"
 
     def project_external_embedding(self, embedding: np.ndarray, modality: str = "text") -> np.ndarray:
+        # app.py 등 외부 코드가 만든 임베딩도 CLIP 검색 공간 차원에 맞춰 흡수한다.
         model, _, dim = self._require_components()
         vector = np.asarray(embedding, dtype=np.float32)
         if vector.size == 0:
@@ -289,6 +296,7 @@ class MultimodalSearchEngine:
 
         file_dir = Path(__file__).resolve().parent
         project_root = file_dir.parent
+        # docker-compose와 로컬 실행을 모두 지원하기 위해 후보 경로를 순서대로 확인한다.
         candidates = [
             os.getenv("DATA_ROOT"),
             file_dir / "data",
@@ -310,6 +318,7 @@ class MultimodalSearchEngine:
         return project_root / "data"
 
     def _build_dummy_items(self) -> List[SearchItem]:
+        # test 모드에서는 더미 이미지와 설명을 직접 만들어 즉시 검색 가능 상태로 만든다.
         palette = [
             (231, 76, 60),
             (52, 152, 219),
@@ -362,6 +371,7 @@ class MultimodalSearchEngine:
         return items
 
     def _load_production_items(self) -> List[SearchItem]:
+        # production 모드에서는 H&M articles.csv를 읽어 상품 메타데이터를 구성한다.
         articles_path = self.data_root / "articles.csv"
         if not articles_path.exists():
             raise FileNotFoundError(f"articles.csv not found: {articles_path}")
@@ -449,6 +459,7 @@ class MultimodalSearchEngine:
 
     @staticmethod
     def _build_article_description(row: pd.Series) -> str:
+        # CLIP 텍스트 검색 품질을 위해 색상/카테고리/설명 필드를 하나의 문장으로 합친다.
         fields = [
             str(row.get("prod_name", "")).strip(),
             str(row.get("product_type_name", "")).strip(),
@@ -464,6 +475,7 @@ class MultimodalSearchEngine:
         return " | ".join(field for field in fields if field)
 
     def _locate_article_image(self, row: pd.Series) -> Optional[Image.Image]:
+        # 이미지가 있으면 텍스트와 함께 상품 임베딩에 반영하고, 없으면 텍스트만 사용한다.
         image_name = str(row.get("image_name", "")).strip()
         article_id = self._article_id(row)
         candidates: List[Path] = []
@@ -499,6 +511,7 @@ class MultimodalSearchEngine:
         return None
 
     def _build_index(self) -> None:
+        # 엔진 내부 데이터셋으로부터 상품별 CLIP 임베딩을 생성해 기본 인덱스를 만든다.
         vectors: List[np.ndarray] = []
         for item in self.items:
             vectors.append(self.embedder.embed_item(text=item.description or item.name, image=item.image))
@@ -512,6 +525,7 @@ class MultimodalSearchEngine:
         self.item_ids = [str(item.product_id) for item in self.items]
 
         if faiss is not None:
+            # Inner Product + L2 normalize 조합이라 cosine similarity 검색처럼 동작한다.
             self.index = faiss.IndexHNSWFlat(self.dimension, 32, faiss.METRIC_INNER_PRODUCT)
             self.index.hnsw.efConstruction = 200
             self.index.hnsw.efSearch = 64
@@ -529,6 +543,7 @@ class MultimodalSearchEngine:
         item_ids: Optional[Sequence[Any]] = None,
         metadatas: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> None:
+        # app.py가 외부에서 만든 임베딩을 넘기는 레거시 경로와의 호환용 빌더다.
         vectors = np.asarray(embeddings, dtype=np.float32)
         if vectors.ndim < 2:
             raise ValueError("embeddings must be at least a 2D array")
@@ -590,6 +605,7 @@ class MultimodalSearchEngine:
         if self.index is None:
             raise RuntimeError("Search index is not initialized")
 
+        # 인덱스와 쿼리를 모두 정규화해 inner product 검색이 안정적으로 되도록 한다.
         query_vec = query_vec.astype(np.float32).reshape(1, -1)
         if faiss is not None:
             faiss.normalize_L2(query_vec)
@@ -608,6 +624,7 @@ class MultimodalSearchEngine:
         return results
 
     def _prepare_query_vector(self, query_vec: np.ndarray, modality: str) -> np.ndarray:
+        # 외부 임베딩의 shape이 달라도 현재 인덱스 차원에 맞는 단일 쿼리 벡터로 변환한다.
         vector = np.asarray(query_vec, dtype=np.float32)
         if vector.size == 0:
             return np.zeros(self.dimension, dtype=np.float32)
@@ -628,6 +645,7 @@ class MultimodalSearchEngine:
         text_embedding: Optional[np.ndarray] = None,
         image_embedding: Optional[np.ndarray] = None,
     ) -> Any:
+        # 1) 외부 임베딩 호환 모드: app.py가 직접 만든 벡터를 받아 검색
         if query_type is not None or embedding is not None or text_embedding is not None or image_embedding is not None:
             top_k = max(1, int(top_k or self.top_k_default))
             if query_type == "hybrid":
@@ -648,6 +666,7 @@ class MultimodalSearchEngine:
                 return []
             return self._search_from_vector(query_vec, top_k)
 
+        # 2) self-contained 모드: query/image를 받아 이 파일 내부에서 CLIP 임베딩까지 수행
         if self.index is None:
             raise RuntimeError("Search index is not initialized")
 
