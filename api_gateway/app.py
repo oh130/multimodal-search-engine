@@ -9,6 +9,7 @@ API Gateway — port 8000
   GET  /health
 """
 
+import json
 import os
 import httpx
 from contextlib import asynccontextmanager
@@ -83,6 +84,7 @@ async def recommend(
         "top_n": top_n,
         "recent_clicks": ",".join(features["recent_clicks"]),
         "click_count": features["click_count"],
+        "session_interest": json.dumps(features["session_interest"]) if features["session_interest"] else None,
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
