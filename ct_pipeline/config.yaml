@@ -1,0 +1,16 @@
+thresholds:
+  HitRate@50: 0.20
+  NDCG@50: 0.08
+  Coverage@50: 0.20
+  Recall@300: 0.30
+  auc: 0.70
+
+retrain_trigger:
+  new_log_count: 10000
+
+redis:
+  host: localhost
+  port: 6379
+
+metrics_path: ../rec_models/reports/baseline/baseline_metrics.json
+version_path: ./version.txt

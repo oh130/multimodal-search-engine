@@ -54,6 +54,17 @@ services:
     ports:
       - "8501:8501"
 
+  # CT 파이프라인
+  ct-pipeline:
+    build: ./ct_pipeline
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    volumes:
+      - ./rec_models/reports:/rec_models/reports:ro
+
   # 시뮬레이터
   simulator:
     build: ./simulator

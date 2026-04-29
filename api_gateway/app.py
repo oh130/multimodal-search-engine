@@ -103,6 +103,7 @@ async def recommend(
 async def events(req: EventRequest):
     """클릭/구매 이벤트를 Redis에 저장하고 rec-models 세션도 업데이트한다."""
     # Redis 업데이트
+    feature_store.r.incr("ct:event_count")
     if req.event_type in ("click", "purchase"):
         feature_store.push_click(req.user_id, req.item_id)
 
