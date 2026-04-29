@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -27,10 +28,12 @@ MODE_CONFIG = {
     },
 }
 
-if MODE not in MODE_CONFIG:
-    raise ValueError(f"Unsupported MODE: {MODE}")
+RUNTIME_MODE = os.getenv("DATA_PIPELINE_MODE", MODE).strip().lower()
 
-CONFIG = MODE_CONFIG[MODE]
+if RUNTIME_MODE not in MODE_CONFIG:
+    raise ValueError(f"Unsupported MODE: {RUNTIME_MODE}")
+
+CONFIG = MODE_CONFIG[RUNTIME_MODE]
 MAX_TRANSACTION_ROWS: Optional[int] = CONFIG["MAX_TRANSACTION_ROWS"]
 OUTPUT_FILE: Path = CONFIG["OUTPUT_FILE"]
 LOG_EVERY_N_ROWS: int = CONFIG["LOG_EVERY_N_ROWS"]
@@ -79,6 +82,12 @@ def validate_required_columns(file_path: Path, required_columns: Sequence[str]) 
         raise ValueError(
             f"Missing required columns in {file_path}: {', '.join(missing_columns)}"
         )
+
+
+def resolve_required_file(file_path: Path, description: str) -> Path:
+    if file_path.exists():
+        return file_path
+    raise FileNotFoundError(f"Missing {description}: {file_path}")
 
 
 def parse_transaction_date(raw_value: str) -> Optional[date]:
@@ -201,17 +210,18 @@ def write_item_features(
 
 def main() -> None:
     configure_logging()
-    validate_required_columns(TRANSACTIONS_FILE, REQUIRED_COLUMNS)
+    transactions_path = resolve_required_file(TRANSACTIONS_FILE, "transactions raw file")
+    validate_required_columns(transactions_path, REQUIRED_COLUMNS)
     logging.info(
         "mode=%s transactions_file=%s output_file=%s max_transaction_rows=%s new_item_window_days=%s",
-        MODE,
-        TRANSACTIONS_FILE,
+        RUNTIME_MODE,
+        transactions_path,
         OUTPUT_FILE,
         MAX_TRANSACTION_ROWS,
         NEW_ITEM_WINDOW_DAYS,
     )
 
-    item_aggregates, dataset_max_date, _ = collect_item_aggregates(TRANSACTIONS_FILE)
+    item_aggregates, dataset_max_date, _ = collect_item_aggregates(transactions_path)
     write_item_features(
         item_aggregates=item_aggregates,
         dataset_max_date=dataset_max_date,
