@@ -71,6 +71,9 @@ async def search(req: SearchRequest):
     return resp.json()
 
 
+RECOMMEND_CACHE_TTL = 300  # 5분
+
+
 @app.get("/api/recommend")
 async def recommend(
     user_id: str = Query(...),
@@ -78,12 +81,19 @@ async def recommend(
 ):
     """Redis 세션 데이터를 붙여 rec-models로 추천 요청을 프록시한다."""
     features = feature_store.get_user_features(user_id)
+    click_count = features["click_count"]
+
+    # 캐시 키: 클릭 수가 바뀌면 자동으로 캐시 무효화
+    cache_key = f"cache:recommend:{user_id}:{top_n}:{click_count}"
+    cached = feature_store.r.get(cache_key)
+    if cached:
+        return json.loads(cached)
 
     params = {
         "user_id": user_id,
         "top_n": top_n,
         "recent_clicks": ",".join(features["recent_clicks"]),
-        "click_count": features["click_count"],
+        "click_count": click_count,
         "session_interest": json.dumps(features["session_interest"]) if features["session_interest"] else None,
     }
 
@@ -96,7 +106,9 @@ async def recommend(
         except httpx.RequestError as e:
             raise HTTPException(status_code=503, detail=f"rec-models 연결 실패: {e}")
 
-    return resp.json()
+    result = resp.json()
+    feature_store.r.set(cache_key, json.dumps(result), ex=RECOMMEND_CACHE_TTL)
+    return result
 
 
 @app.post("/api/events")
