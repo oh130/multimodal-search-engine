@@ -1,5 +1,5 @@
 ===== 남은 문제 목록 =====
-기준일: 2026-04-29
+기준일: 2026-04-29  (docker-compose 동작 확인: 2026-04-29)
 
 ────────────────────────────
 [검색 엔진]
@@ -46,17 +46,6 @@
      Coverage@50 = 0.014961  ← 목표 0.20 미달
    - 전체 데이터 기준 재측정 필요
 
-────────────────────────────
-[시뮬레이터]
-────────────────────────────
-7. simulator/ 구현 미완성
-   - Dockerfile, requirements.txt, placeholder main.py 생성 완료
-   - docker-compose 컨테이너 등록 완료 (포트 없음, 백그라운드 프로세스)
-   - 실제 구현 필요:
-     · 6가지 페르소나 정의 (트렌드세터, 실용주의자, 가성비추구, 브랜드충성, 충동구매, 신중탐색)
-     · search / view / cart / purchase 이벤트 생성 로직
-     · 생성 로그를 API Gateway(/api/events)로 실시간 전송
-     · config 파일로 페르소나 비율, 전이 확률 변경 가능하게 구성
 
 ────────────────────────────
 [문서화]
@@ -90,3 +79,11 @@
 ✅ A/B 테스트 통계 검정 (p-value, 신뢰구간) → evaluation/ab_test.py 구현 완료
 ✅ 오프라인 평가 메트릭 (HitRate, MRR, NDCG) → evaluation/metrics.py 구현 완료
 ✅ 프론트엔드 React 앱 → pront/ 구현 완료, docker-compose 컨테이너 추가 완료
+✅ 추천 결과 Redis 캐싱 → api_gateway /api/recommend에 TTL 300s 캐시 구현 완료
+     캐시 키: cache:recommend:{user_id}:{top_n}:{click_count} (클릭 발생 시 자동 무효화)
+✅ simulator/ 구현 완료 — docker-compose 정상 동작 확인 (2026-04-29)
+     - 6가지 페르소나(트렌드세터/실용주의자/가성비추구/브랜드충성/충동구매/신중탐색) 정의
+     - search → click → cart → purchase 상태 머신 구현
+     - /api/events로 이벤트 실시간 전송 (ct:event_count 자동 누적)
+     - config.yaml으로 페르소나 비율, 전이 확률, 딜레이 변경 가능
+     - API Gateway 기동 대기 로직 포함 (docker-compose 순서 무관하게 동작)
