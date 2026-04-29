@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - torch is optional during code-only dev
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_DATA_PATH = BASE_DIR / "data" / "processed" / "train_data_test.csv"
+DEFAULT_DATA_PATH = BASE_DIR / "data" / "processed" / "candidate_train_data_test.csv.gz"
 TARGET_COLUMN = "label"
 USER_ID_COLUMN = "customer_id"
 ITEM_ID_COLUMN = "article_id"
@@ -52,8 +52,31 @@ DEFAULT_USER_CATEGORICAL_COLUMNS = (
     "age_bucket",
     "fashion_news_frequency",
     "club_member_status",
+    "preferred_garment_group",
+    "preferred_colour_master",
+    "preferred_main_category",
+    "preferred_season",
+    "price_band",
+    "activity_segment",
 )
-DEFAULT_USER_NUMERIC_COLUMNS = ("age",)
+DEFAULT_USER_NUMERIC_COLUMNS = (
+    "age",
+    "purchase_count",
+    "purchase_count_7d",
+    "purchase_count_30d",
+    "purchase_count_90d",
+    "total_spend",
+    "spend_7d",
+    "spend_30d",
+    "spend_90d",
+    "avg_price",
+    "min_price",
+    "max_price",
+    "recency_days",
+    "purchase_span_days",
+    "online_ratio",
+    "offline_ratio",
+)
 
 DEFAULT_ITEM_CATEGORICAL_COLUMNS = (
     "prod_name",
@@ -67,8 +90,25 @@ DEFAULT_ITEM_CATEGORICAL_COLUMNS = (
     "category",
     "main_category",
     "color",
+    "dominant_age_bucket",
+    "dominant_season",
+    "item_price_band",
+    "popularity_segment",
 )
-DEFAULT_ITEM_NUMERIC_COLUMNS: tuple[str, ...] = ()
+DEFAULT_ITEM_NUMERIC_COLUMNS: tuple[str, ...] = (
+    "item_purchase_count",
+    "item_purchase_count_7d",
+    "item_purchase_count_30d",
+    "item_purchase_count_90d",
+    "item_total_spend",
+    "item_avg_price",
+    "item_min_price",
+    "item_max_price",
+    "item_days_since_last_purchase",
+    "item_freshness_days",
+    "item_online_ratio",
+    "item_offline_ratio",
+)
 
 
 @dataclass(slots=True, frozen=True)

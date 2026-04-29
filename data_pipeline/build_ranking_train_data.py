@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import logging
+import os
 import random
 import tempfile
 import time
@@ -35,10 +36,12 @@ MODE_CONFIG = {
     },
 }
 
-if MODE not in MODE_CONFIG:
-    raise ValueError(f"Unsupported MODE: {MODE}")
+RUNTIME_MODE = os.getenv("DATA_PIPELINE_MODE", MODE).strip().lower()
 
-CONFIG = MODE_CONFIG[MODE]
+if RUNTIME_MODE not in MODE_CONFIG:
+    raise ValueError(f"Unsupported MODE: {RUNTIME_MODE}")
+
+CONFIG = MODE_CONFIG[RUNTIME_MODE]
 MAX_TRANSACTION_ROWS: Optional[int] = CONFIG["MAX_TRANSACTION_ROWS"]
 NEGATIVE_RATIO: int = CONFIG["NEGATIVE_RATIO"]
 OUTPUT_FILE: Path = CONFIG["OUTPUT_FILE"]
@@ -100,6 +103,7 @@ PARTITION_COLUMNS = [
     "price",
     "sales_channel_id",
 ]
+TRANSACTION_REQUIRED_COLUMNS = PARTITION_COLUMNS
 
 StatsDict = Dict[str, int]
 CustomerFeature = Dict[str, str]
@@ -541,14 +545,16 @@ def build_train_dataset(
 def main() -> None:
     configure_logging()
     run_start = time.perf_counter()
+    transactions_path = resolve_required_file(TRANSACTIONS_FILE, "transactions raw file")
     customer_path = resolve_required_file(CUSTOMER_FEATURES_FILE, "customer feature file")
     article_path = resolve_required_file(ARTICLE_FEATURES_FILE, "article feature file")
+    validate_required_columns(transactions_path, TRANSACTION_REQUIRED_COLUMNS, "customer_id")
     validate_required_columns(customer_path, CUSTOMER_FEATURE_COLUMNS, "customer_id")
     validate_required_columns(article_path, ARTICLE_FEATURE_COLUMNS, "article_id")
     logging.info(
         "mode=%s transactions_file=%s customer_features_file=%s article_features_file=%s output_file=%s max_transaction_rows=%s negative_ratio=%s partition_count=%s random_seed=%s",
-        MODE,
-        TRANSACTIONS_FILE,
+        RUNTIME_MODE,
+        transactions_path,
         customer_path,
         article_path,
         OUTPUT_FILE,
