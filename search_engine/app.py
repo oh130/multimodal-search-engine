@@ -29,7 +29,7 @@ from search_engine import MultimodalSearchEngine
 LOGGER = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 512
-TEST_SAMPLE_SIZE = 5000
+TEST_SAMPLE_SIZE = 500
 DATA_PATH = Path("/app/data/processed/articles_feature.csv")
 
 # test/production 인덱스 캐시 경로 분리
