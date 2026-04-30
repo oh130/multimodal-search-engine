@@ -218,6 +218,20 @@ rec_models/checkpoints/*.pt
 rec_models/checkpoints/*.joblib
 rec_models/checkpoints/*_metadata.json
 
+# Generated documents
+output/
+
+# Candidate experiment artifacts
+rec_models/reports/candidate_experiments/**/checkpoints/
+rec_models/reports/candidate_experiments/**/exp_*.json
+rec_models/reports/candidate_experiments/**/summary.json
+rec_models/reports/candidate_experiments/**/summary.csv
+rec_models/reports/candidate_experiments/**/baseline_metrics.json
+rec_models/reports/candidate_experiments/**/manifest.json
+
+# Accidental root npm lockfile
+/package-lock.json
+
 # ========================
 # Local config
 # ========================

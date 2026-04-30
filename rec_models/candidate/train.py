@@ -53,6 +53,9 @@ DEFAULT_EPOCHS = 5
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-5
 DEFAULT_VALIDATION_K = 300
+DEFAULT_NEGATIVES_PER_POSITIVE = 0
+DEFAULT_HARD_NEGATIVE_RATIO = 0.5
+DEFAULT_SAMPLED_NEGATIVE_WEIGHT = 1.0
 DEFAULT_CHECKPOINT_DIR = Path(__file__).resolve().parents[2] / "data" / "checkpoints" / "candidate"
 DEFAULT_MODEL_ARTIFACT = "two_tower.pt"
 DEFAULT_METADATA_ARTIFACT = "two_tower_metadata.json"
@@ -74,6 +77,9 @@ class TrainingConfig:
     weight_decay: float = DEFAULT_WEIGHT_DECAY
     validation_ratio: float = 0.2
     validation_k: int = DEFAULT_VALIDATION_K
+    negatives_per_positive: int = DEFAULT_NEGATIVES_PER_POSITIVE
+    hard_negative_ratio: float = DEFAULT_HARD_NEGATIVE_RATIO
+    sampled_negative_weight: float = DEFAULT_SAMPLED_NEGATIVE_WEIGHT
     device: str = "cpu"
     checkpoint_dir: str = str(DEFAULT_CHECKPOINT_DIR)
     model_artifact: str = DEFAULT_MODEL_ARTIFACT
@@ -89,6 +95,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY, help="AdamW weight decay.")
     parser.add_argument("--validation-ratio", type=float, default=0.2, help="User-level validation holdout ratio.")
     parser.add_argument("--validation-k", type=int, default=DEFAULT_VALIDATION_K, help="Recall@K cutoff for validation.")
+    parser.add_argument(
+        "--negatives-per-positive",
+        type=int,
+        default=DEFAULT_NEGATIVES_PER_POSITIVE,
+        help="Number of explicit negatives to sample per positive pair.",
+    )
+    parser.add_argument(
+        "--hard-negative-ratio",
+        type=float,
+        default=DEFAULT_HARD_NEGATIVE_RATIO,
+        help="Fraction of explicit negatives sampled from the positive item's main category.",
+    )
+    parser.add_argument(
+        "--sampled-negative-weight",
+        type=float,
+        default=DEFAULT_SAMPLED_NEGATIVE_WEIGHT,
+        help="Loss weight applied to the sampled-negative term.",
+    )
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR, help="Directory for model artifacts.")
     parser.add_argument("--device", type=str, help="Training device override, e.g. cpu or cuda.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
@@ -131,11 +155,72 @@ def retrieval_loss(logits: Tensor) -> Tensor:
     return F.cross_entropy(logits, targets)
 
 
+def build_sampled_negative_batch(
+    dataset: TwoTowerPairDataset,
+    customer_ids: list[str],
+    positive_item_ids: list[str],
+    negatives_per_positive: int,
+    hard_negative_ratio: float,
+) -> dict[str, Tensor] | None:
+    """Sample and encode explicit negatives aligned to a positive batch."""
+
+    if negatives_per_positive <= 0:
+        return None
+
+    sampled_item_ids: list[str] = []
+    for row_index, (customer_id, positive_item_id) in enumerate(zip(customer_ids, positive_item_ids, strict=False)):
+        rng = np.random.default_rng(seed=(hash((customer_id, positive_item_id, row_index)) & 0xFFFFFFFF))
+        sampled = dataset.sample_negative_item_ids(
+            customer_id=customer_id,
+            sample_size=negatives_per_positive,
+            positive_item_id=positive_item_id,
+            hard_negative_ratio=hard_negative_ratio,
+            rng=rng,
+        )
+        if len(sampled) < negatives_per_positive:
+            return None
+        sampled_item_ids.extend(sampled)
+
+    encoded = dataset.encode_item_id_batch(sampled_item_ids)
+    return {
+        "item_categorical": torch.as_tensor(encoded["categorical"], dtype=torch.long),
+        "item_numeric": torch.as_tensor(encoded["numeric"], dtype=torch.float32),
+    }
+
+
+def sampled_negative_loss(
+    model: TwoTowerModel,
+    user_embedding: Tensor,
+    positive_scores: Tensor,
+    negative_batch: dict[str, Tensor] | None,
+    negatives_per_positive: int,
+) -> Tensor | None:
+    """Compute an explicit sampled-negative loss term."""
+
+    if negative_batch is None or negatives_per_positive <= 0:
+        return None
+
+    negative_item_embedding = model.encode_item(
+        item_categorical=negative_batch["item_categorical"],
+        item_numeric=negative_batch["item_numeric"],
+    )
+    batch_size = user_embedding.shape[0]
+    negative_item_embedding = negative_item_embedding.view(batch_size, negatives_per_positive, -1)
+    negative_scores = torch.sum(user_embedding.unsqueeze(1) * negative_item_embedding, dim=-1)
+    logits = torch.cat([positive_scores.unsqueeze(1), negative_scores], dim=1)
+    targets = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
+    return F.cross_entropy(logits, targets)
+
+
 def train_one_epoch(
     model: TwoTowerModel,
+    dataset: TwoTowerPairDataset,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str,
+    negatives_per_positive: int = DEFAULT_NEGATIVES_PER_POSITIVE,
+    hard_negative_ratio: float = DEFAULT_HARD_NEGATIVE_RATIO,
+    sampled_negative_weight: float = DEFAULT_SAMPLED_NEGATIVE_WEIGHT,
 ) -> float:
     """Run one training epoch and return average loss."""
 
@@ -153,6 +238,25 @@ def train_one_epoch(
             item_numeric=prepared["item_numeric"],
         )
         loss = retrieval_loss(outputs["logits"])
+        if negatives_per_positive > 0:
+            negative_batch = build_sampled_negative_batch(
+                dataset=dataset,
+                customer_ids=list(batch["customer_id"]),
+                positive_item_ids=list(batch["article_id"]),
+                negatives_per_positive=negatives_per_positive,
+                hard_negative_ratio=hard_negative_ratio,
+            )
+            if negative_batch is not None:
+                negative_batch = {key: value.to(device) for key, value in negative_batch.items()}
+                extra_loss = sampled_negative_loss(
+                    model=model,
+                    user_embedding=outputs["user_embedding"],
+                    positive_scores=outputs["positive_scores"],
+                    negative_batch=negative_batch,
+                    negatives_per_positive=negatives_per_positive,
+                )
+                if extra_loss is not None:
+                    loss = loss + (sampled_negative_weight * extra_loss)
         loss.backward()
         optimizer.step()
 
@@ -303,7 +407,16 @@ def train_two_tower(training_config: TrainingConfig) -> dict[str, Any]:
     history: list[dict[str, float]] = []
 
     for epoch in range(1, training_config.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer=optimizer, device=training_config.device)
+        train_loss = train_one_epoch(
+            model,
+            dataset=dataset_artifacts.train_dataset,
+            dataloader=train_loader,
+            optimizer=optimizer,
+            device=training_config.device,
+            negatives_per_positive=training_config.negatives_per_positive,
+            hard_negative_ratio=training_config.hard_negative_ratio,
+            sampled_negative_weight=training_config.sampled_negative_weight,
+        )
         validation_recall = evaluate_recall(
             model,
             dataset_artifacts=dataset_artifacts,
@@ -353,6 +466,9 @@ def main() -> None:
         weight_decay=args.weight_decay,
         validation_ratio=args.validation_ratio,
         validation_k=args.validation_k,
+        negatives_per_positive=args.negatives_per_positive,
+        hard_negative_ratio=args.hard_negative_ratio,
+        sampled_negative_weight=args.sampled_negative_weight,
         device=device,
         checkpoint_dir=str(args.checkpoint_dir.expanduser().resolve()),
     )

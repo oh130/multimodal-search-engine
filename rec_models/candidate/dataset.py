@@ -42,6 +42,8 @@ except ImportError:  # pragma: no cover - torch is optional during code-only dev
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_PATH = BASE_DIR / "data" / "processed" / "candidate_train_data_test.csv.gz"
+DEFAULT_ITEM_FEATURES_PATH = BASE_DIR / "data" / "processed" / "item_features.csv"
+DEFAULT_ITEM_FEATURES_TEST_PATH = BASE_DIR / "data" / "processed" / "item_features_test.csv"
 TARGET_COLUMN = "label"
 USER_ID_COLUMN = "customer_id"
 ITEM_ID_COLUMN = "article_id"
@@ -109,8 +111,6 @@ DEFAULT_ITEM_NUMERIC_COLUMNS: tuple[str, ...] = (
     "item_online_ratio",
     "item_offline_ratio",
 )
-
-
 @dataclass(slots=True, frozen=True)
 class FeatureSchema:
     """Column contract shared by dataset, model, and inference code."""
@@ -247,6 +247,16 @@ def normalize_categorical_value(value: Any) -> str:
 def normalize_numeric_value(value: Any, default: float = 0.0) -> float:
     """Normalize numeric values for dense features."""
 
+    if isinstance(value, bool):
+        return float(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "y"}:
+            return 1.0
+        if normalized in {"false", "no", "n"}:
+            return 0.0
+
     numeric = pd.to_numeric(value, errors="coerce")
     if pd.isna(numeric):
         return float(default)
@@ -260,6 +270,71 @@ def normalize_item_id(value: Any) -> str:
     if text.isdigit():
         return text.zfill(10)
     return text
+
+
+def _resolve_item_feature_path() -> Path | None:
+    for path in (DEFAULT_ITEM_FEATURES_PATH, DEFAULT_ITEM_FEATURES_TEST_PATH):
+        if path.exists():
+            return path
+    return None
+
+
+def enrich_with_item_features(
+    data: pd.DataFrame,
+    item_feature_path: Path | None = None,
+    numeric_columns: Sequence[str] = DEFAULT_ITEM_NUMERIC_COLUMNS,
+) -> pd.DataFrame:
+    """Attach item-level numeric features used by retrieval experiments.
+
+    The processed ranking dataset does not currently contain serving-time item
+    aggregates such as popularity or freshness. This helper merges those
+    features from `item_features(.csv)` when available so retrieval training can
+    use the same item signals already exposed elsewhere in the project.
+    """
+
+    missing_numeric_columns = [column for column in numeric_columns if column not in data.columns]
+    if not missing_numeric_columns:
+        return data
+
+    resolved_item_feature_path = item_feature_path or _resolve_item_feature_path()
+    if resolved_item_feature_path is None:
+        LOGGER.warning(
+            "Item feature file not found. Continuing without additional item numeric features."
+        )
+        enriched = data.copy()
+        for column in missing_numeric_columns:
+            if column not in enriched.columns:
+                enriched[column] = 0.0
+        return enriched
+
+    item_features = pd.read_csv(resolved_item_feature_path, dtype={"article_id": str}).fillna("")
+    item_features["article_id"] = item_features["article_id"].map(normalize_item_id)
+
+    available_numeric_columns = [column for column in missing_numeric_columns if column in item_features.columns]
+    if not available_numeric_columns:
+        enriched = data.copy()
+        for column in missing_numeric_columns:
+            if column not in enriched.columns:
+                enriched[column] = 0.0
+        return enriched
+
+    merge_columns = ["article_id", *available_numeric_columns]
+    enriched = data.merge(
+        item_features.loc[:, merge_columns].drop_duplicates("article_id"),
+        on="article_id",
+        how="left",
+        suffixes=("", "_item_feature"),
+    )
+    for column in missing_numeric_columns:
+        if column not in enriched.columns:
+            enriched[column] = 0.0
+
+    LOGGER.info(
+        "Merged item numeric features from %s | columns=%s",
+        resolved_item_feature_path,
+        available_numeric_columns,
+    )
+    return enriched
 
 
 def load_candidate_training_data(csv_path: Path = DEFAULT_DATA_PATH) -> pd.DataFrame:
@@ -277,8 +352,9 @@ def load_candidate_training_data(csv_path: Path = DEFAULT_DATA_PATH) -> pd.DataF
 
     data[USER_ID_COLUMN] = data[USER_ID_COLUMN].astype(str)
     data[ITEM_ID_COLUMN] = data[ITEM_ID_COLUMN].map(normalize_item_id)
-    LOGGER.info("Loaded candidate training data from %s | rows=%s", resolved_path, len(data))
-    return data
+    enriched = enrich_with_item_features(data)
+    LOGGER.info("Loaded candidate training data from %s | rows=%s", resolved_path, len(enriched))
+    return enriched
 
 
 def filter_positive_interactions(data: pd.DataFrame, schema: FeatureSchema | None = None) -> pd.DataFrame:
@@ -398,6 +474,11 @@ class TwoTowerPairDataset(Dataset):
             self.interactions.groupby(self.schema.user_id_column, sort=False)[self.schema.item_id_column].apply(list).to_dict()
         )
         self.all_item_ids = tuple(self.item_records.keys())
+        self.item_to_main_category = {
+            str(item_id): normalize_categorical_value(record.get("main_category"))
+            for item_id, record in self.item_records.items()
+        }
+        self.category_to_item_ids = self._build_category_to_item_ids()
 
     def __len__(self) -> int:
         return len(self.interactions)
@@ -420,10 +501,18 @@ class TwoTowerPairDataset(Dataset):
             "item_numeric": item_features["numeric"],
         }
 
+    def _build_category_to_item_ids(self) -> dict[str, tuple[str, ...]]:
+        category_to_ids: dict[str, list[str]] = {}
+        for item_id, category in self.item_to_main_category.items():
+            category_to_ids.setdefault(category, []).append(str(item_id))
+        return {category: tuple(item_ids) for category, item_ids in category_to_ids.items()}
+
     def sample_negative_item_ids(
         self,
         customer_id: str,
         sample_size: int,
+        positive_item_id: str | None = None,
+        hard_negative_ratio: float = 0.0,
         rng: np.random.Generator | None = None,
     ) -> list[str]:
         """Sample negative items not seen as positives for the given user."""
@@ -433,12 +522,50 @@ class TwoTowerPairDataset(Dataset):
 
         rng = rng or np.random.default_rng()
         positive_items = set(self.user_to_positive_items.get(str(customer_id), []))
-        candidates = [item_id for item_id in self.all_item_ids if item_id not in positive_items]
+        hard_sample_size = min(sample_size, max(0, int(round(sample_size * hard_negative_ratio))))
+        sampled_negatives: list[str] = []
+
+        if positive_item_id is not None and hard_sample_size > 0:
+            main_category = self.item_to_main_category.get(str(positive_item_id), UNKNOWN_TOKEN)
+            hard_candidates = [
+                item_id
+                for item_id in self.category_to_item_ids.get(main_category, ())
+                if item_id not in positive_items and item_id != str(positive_item_id)
+            ]
+            if hard_candidates:
+                hard_count = min(hard_sample_size, len(hard_candidates))
+                hard_sample = rng.choice(hard_candidates, size=hard_count, replace=False)
+                sampled_negatives.extend(str(item_id) for item_id in hard_sample.tolist())
+
+        remaining_sample_size = max(0, sample_size - len(sampled_negatives))
+        if remaining_sample_size <= 0:
+            return sampled_negatives
+
+        candidates = [
+            item_id
+            for item_id in self.all_item_ids
+            if item_id not in positive_items and item_id not in sampled_negatives
+        ]
         if not candidates:
-            return []
-        sample_count = min(sample_size, len(candidates))
+            return sampled_negatives
+        sample_count = min(remaining_sample_size, len(candidates))
         sampled = rng.choice(candidates, size=sample_count, replace=False)
-        return [str(item_id) for item_id in sampled.tolist()]
+        sampled_negatives.extend(str(item_id) for item_id in sampled.tolist())
+        return sampled_negatives
+
+    def encode_item_id_batch(self, item_ids: Sequence[str]) -> dict[str, np.ndarray]:
+        """Encode many item ids into stacked categorical/numeric arrays."""
+
+        encoded_rows = [self.encoder.encode_item_row(self.item_records[str(item_id)]) for item_id in item_ids]
+        if not encoded_rows:
+            return {
+                "categorical": np.empty((0, len(self.schema.item_categorical_columns)), dtype=np.int64),
+                "numeric": np.empty((0, len(self.schema.item_numeric_columns)), dtype=np.float32),
+            }
+        return {
+            "categorical": np.stack([row["categorical"] for row in encoded_rows]).astype(np.int64),
+            "numeric": np.stack([row["numeric"] for row in encoded_rows]).astype(np.float32),
+        }
 
 
 def collate_two_tower_batch(examples: Sequence[dict[str, Any]], as_torch: bool = False) -> dict[str, Any]:
@@ -512,4 +639,3 @@ def save_dataset_metadata(metadata: dict[str, Any], output_path: Path) -> None:
     resolved_path = output_path.expanduser().resolve()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
